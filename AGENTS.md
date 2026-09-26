@@ -8,7 +8,9 @@ Rules for any coding agent working on this repo.
   Status comes from pane text in `lib/status.js`; extend its patterns with a test built from a real
   screen.
 - Keep `lib/guard.js` checks (Host, Tailscale identity, Origin, forbidden paths) covered by
-  `test/guard.test.js`. Any new route goes through `checkRequest`.
+  `test/guard.test.js`. Any new route goes through `checkRequest` and the paired-device check in
+  `server.js` (only `STATIC` files and `POST /api/pair` are reachable unpaired); cover pairing in
+  `test/pairing.test.js`.
 - Per-machine values (login, host, paths, commands) belong in `cockpit.config.json` (gitignored),
   never in code, tests or docs. Tests use example values and a temp directory.
 - Alerts carry session name + link only. Never send pane content off the machine.

@@ -5,5 +5,8 @@
   "projectsRoot": "/Users/you/projects",
   "forbiddenPaths": ["/Users/you/projects/secret-stuff"],
   "notifyCommand": [],
-  "sessionClosedCommand": ""
+  "sessionClosedCommand": "",
+  "uploadsDir": "",
+  "uploadMaxMB": 200,
+  "transcribeCommand": ["/Users/you/.venvs/mlx-whisper/bin/python", "lib/whisper_transcribe.py"]
 }

@@ -2,7 +2,7 @@
 
 Watch and drive Claude Code, Codex, Grok and agy CLI sessions running on your Mac from your phone.
 Each session is a real terminal in a private tmux server; the phone gets a live terminal, quick
-keys, a message box (use keyboard dictation for voice), and a "needs you" status when an agent is
+keys, a message box with photo/file attach and on-Mac voice dictation, and a "needs you" status when an agent is
 waiting on an approval.
 
 It is a remote shell into your Mac, so it listens only on loopback (or a private Unix socket) and
@@ -15,7 +15,7 @@ request. Read **Security** below before you run it.
 | --- | --- |
 | List | See every session with status: working / needs you / idle / exited |
 | + New | Pick a lane (claude, codex, grok, agy, shell), a project, optional first message |
-| Session | Live terminal; quick keys (Esc, Enter, arrows, Tab, Shift-Tab, Ctrl-C, 1/2/3, y/n); message box; History (plain-text scrollback); End (two taps) |
+| Session | **Read** view (default on phones): the whole scrollback, swipeable, refreshed live, with a "↓ Latest" button. **Live** view: the real terminal, reconnects by itself. Quick keys (Esc, Enter, arrows, Tab, Shift-Tab, Ctrl-C, 1/2/3, y/n). Message box (multi-line is sent as one message). 📎 attach photos, camera shots or files; 🎤 dictate (transcribed on the Mac, lands in the box for review). End (two taps) |
 
 ## Requirements
 
@@ -46,6 +46,11 @@ request. Read **Security** below before you run it.
    | `forbiddenPaths` | Folders the cockpit must never open or list (e.g. work or client data). |
    | `notifyCommand` | Optional alert command; the message is appended as the last argument, e.g. `["/usr/local/bin/my-notify"]`. Enabled with `COCKPIT_NOTIFY=1`. |
    | `sessionClosedCommand` | Optional shell command tmux runs when a session ends (`#{hook_session_name}` is the session). |
+   | `uploadsDir` | Where files sent from the phone are saved, one folder per session. Default `state/uploads` in this folder. Claude and Codex sessions get their own folder via `--add-dir`, so they can read uploads without a permission prompt. |
+   | `uploadMaxMB` | Largest upload accepted. Default 200. |
+   | `stateDir` | Owner-only folder for paired devices and pending pair codes. Default `~/.agent-cockpit`. |
+   | `pairing` | Default `true`: every phone pairs once before it can do anything. Set `false` (or `COCKPIT_PAIRING=0`) only for local testing. |
+   | `transcribeCommand` | Optional speech-to-text command for the 🎤 button; the audio file path is appended and the text is read from stdout. `lib/whisper_transcribe.py` works with any Python that has `mlx_whisper` (Apple silicon) and `ffmpeg` on `PATH`; model via `COCKPIT_WHISPER_MODEL`. Without it the mic button is hidden. |
 
    `cockpit.config.json` is gitignored. `COCKPIT_SOCKET`, `COCKPIT_PORT` (TCP mode, default 8826),
    `COCKPIT_USER` and `COCKPIT_PUBLIC_HOST` environment variables override the file.
@@ -61,6 +66,17 @@ request. Read **Security** below before you run it.
 
 4. On the phone open `https://<publicHost>` and use Share → Add to Home Screen for an app icon.
 
+5. Pair the phone. Open the cockpit **from the Home Screen icon** (iOS keeps its cookies separate
+   from Safari), then on the Mac run:
+
+   ```bash
+   npm run pair
+   ```
+
+   Type the code it prints into the phone. The code works once and expires in 10 minutes; five
+   wrong tries burn it. `npm run pair -- list` shows paired phones and `npm run pair -- revoke <id>`
+   (or `all`) unpairs them.
+
 To keep it running across reboots, make a LaunchAgent that runs `node server.js` in this folder
 with `KeepAlive` and `LimitLoadToSessionType` = `Aqua`. The Aqua session matters: it is what lets
 agents started from the phone reach your login Keychain (for `gh`, `git push`, etc.).
@@ -69,12 +85,14 @@ agents started from the phone reach your login Keychain (for `gh`, `git push`, e
 
 Anyone who gets through the cockpit can run any command as you. Know these limits:
 
-- **Loopback is shared by everyone on the Mac.** In the default TCP mode the server is on
-  `127.0.0.1`, which every program and every other user account on the Mac can reach, and any of
-  them can fake the Tailscale identity headers. On a Mac with only your account this adds little
-  (those programs already run as you). **If the Mac has other user accounts, don't run it in TCP
-  mode.**
-- `socketPath` closes that gap with an owner-only Unix socket, but the Tailscale Mac apps (App
+- **Pairing is what stops local impersonation.** The server listens on `127.0.0.1`, which every
+  program and every other user account on the Mac can reach, and any of them can fake the
+  Tailscale identity headers. So each phone also needs a device cookie, which it only gets by
+  entering a one-time code from `npm run pair`. The codes and device list live in `stateDir`,
+  readable only by you, and only hashes are stored. Keep `pairing` on.
+- Programs running as *your own* user can still read `stateDir` or run `npm run pair`, but they
+  can already do anything you can, so that adds nothing.
+- `socketPath` (an owner-only Unix socket) is a further layer, but the Tailscale Mac apps (App
   Store and standalone) can't proxy to Unix sockets: `serve` answers 502 even for a world-readable
   socket (tested). It should work with the open-source `tailscaled` daemon running as root
   (untested).
@@ -85,13 +103,17 @@ Anyone who gets through the cockpit can run any command as you. Know these limit
   Tailscale's device approval and key expiry.
 - Agents started from the phone run with your full permissions and Keychain access, the same as
   if you had typed the command at the Mac.
+- Claude's agent view (← on an empty prompt), which lists and can attach to every Claude session
+  on the Mac, is turned off in cockpit sessions. `/resume` inside Claude can still list other
+  projects' sessions.
 - `forbiddenPaths` only affects what the project picker offers and allows as a starting folder.
   Once a session is running, it can `cd` anywhere you can.
 
 ## Guards
 
-- Every request must carry the Tailscale identity in `user`, an allowed `Host`, and (for anything
-  that changes state, including the WebSocket) a same-origin `Origin`. Tailscale overwrites the
+- Every request except the page's own files must carry a paired-device cookie, the Tailscale
+  identity in `user`, an allowed `Host`, and (for anything that changes state, including the
+  WebSocket) a same-origin `Origin`. Tailscale overwrites the
   identity header, so it cannot be forged from the tailnet.
 - Requests with a loopback `Host` are refused unless `COCKPIT_ALLOW_LOCAL=1` (handy for testing
   on the Mac).
@@ -103,7 +125,7 @@ Anyone who gets through the cockpit can run any command as you. Know these limit
 ## Run by hand for testing
 
 ```bash
-COCKPIT_SOCKET= COCKPIT_ALLOW_LOCAL=1 node server.js
+COCKPIT_SOCKET= COCKPIT_ALLOW_LOCAL=1 COCKPIT_PAIRING=0 node server.js
 ```
 
 Then open `http://127.0.0.1:8826` (TCP mode, for testing only).

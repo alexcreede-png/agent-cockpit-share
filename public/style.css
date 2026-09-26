@@ -16,7 +16,10 @@
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
-  font: 15px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
+  font: 15px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  -webkit-text-size-adjust: 100%; }
+/* Pin the app to the screen: no rubber-band drift; only inner panes scroll. */
+html, body { position: fixed; inset: 0; overflow: hidden; overscroll-behavior: none; }
 [hidden] { display: none !important; }
 button, input, textarea { font: inherit; color: inherit; }
 button { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; }
@@ -29,7 +32,7 @@ button:active { opacity: .7; }
 .warn { color: var(--warn); }
 .center { text-align: center; padding: 24px 16px; }
 
-.view { display: flex; flex-direction: column; height: 100dvh; padding-bottom: env(safe-area-inset-bottom); }
+.view { display: flex; flex-direction: column; height: var(--app-h, 100dvh); padding-bottom: env(safe-area-inset-bottom); }
 .bar { display: flex; align-items: center; gap: 8px; padding: calc(8px + env(safe-area-inset-top)) 16px 8px;
   border-bottom: 1px solid var(--line); background: var(--panel); }
 .bar h1 { font-size: 18px; margin: 0; }
@@ -64,10 +67,34 @@ button:active { opacity: .7; }
 .pick li { padding: 10px 12px; border-bottom: 1px solid var(--line); font-size: 14px; }
 .pick li.on { background: var(--accent); color: #fff; }
 
-#term { flex: 1; min-height: 0; background: var(--term-bg); padding: 4px; overflow: hidden; }
-#history { flex: 1; min-height: 0; margin: 0; padding: 10px; overflow: auto; background: var(--term-bg);
-  color: #d1d5db; font: 12px/1.35 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-word; }
+/* Session: scrollable transcript (read) or live terminal, with overlays. */
+.stage { position: relative; flex: 1; min-height: 0; display: flex; background: var(--term-bg); }
+#term { flex: 1; min-width: 0; padding: 4px; overflow: hidden; }
+#reader { flex: 1; min-width: 0; margin: 0; padding: 10px 12px 48px; overflow-y: auto; overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch; color: #d1d5db; font: 12px/1.4 ui-monospace, Menlo, monospace;
+  white-space: pre-wrap; word-break: break-word; -webkit-user-select: text; user-select: text; }
+.float { position: absolute; right: 12px; bottom: 12px; border: none; border-radius: 999px; background: var(--accent);
+  color: #fff; padding: 8px 14px; font-size: 13px; box-shadow: 0 2px 10px rgba(0,0,0,.45); }
+.note { position: absolute; left: 50%; top: 10px; transform: translateX(-50%); max-width: calc(100% - 32px);
+  background: rgba(20,22,28,.92); color: #fff; font-size: 13px; padding: 6px 12px; border-radius: 999px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .keys { display: flex; gap: 6px; padding: 6px 8px; overflow-x: auto; background: var(--panel); border-top: 1px solid var(--line); }
 .keys button { flex: none; padding: 6px 10px; font: 13px ui-monospace, Menlo, monospace; }
-.input-row { display: flex; gap: 8px; padding: 6px 8px 8px; background: var(--panel); }
-.input-row textarea { resize: none; max-height: 30dvh; }
+.input-row { display: flex; align-items: flex-end; gap: 6px; padding: 6px 8px 8px; background: var(--panel); }
+/* 16px stops iOS zooming the page when the box is focused. */
+.input-row textarea { resize: none; max-height: 30dvh; font-size: 16px; min-width: 0; flex: 1; }
+.icon { flex: none; width: 42px; height: 42px; padding: 0; display: grid; place-items: center; grid-auto-flow: column; gap: 2px; }
+.mic.rec { width: auto; padding: 0 10px; background: var(--exited); color: #fff; border-color: var(--exited); }
+.mic.busy { opacity: .6; }
+#mic-label { font-size: 12px; font-variant-numeric: tabular-nums; }
+#attach-row { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 8px 0; background: var(--panel); }
+.chip { display: inline-flex; align-items: center; max-width: 100%; font-size: 13px; background: var(--line);
+  border-radius: 999px; padding: 2px 2px 2px 10px; }
+.chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip.busy { opacity: .7; }
+.chip button { border: none; background: none; padding: 2px 8px; }
+.form input, .form textarea { font-size: 16px; }
+
+/* pairing */
+.pair { display: flex; flex-direction: column; gap: 12px; padding: 16px; }
+.pair input { font-size: 22px; letter-spacing: .15em; text-align: center; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); text-transform: uppercase; }

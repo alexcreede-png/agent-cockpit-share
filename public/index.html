@@ -27,6 +27,17 @@
   <p id="conn" class="warn center" hidden>Can't reach the Mac.</p>
 </section>
 
+<!-- Pair this phone (shown when the server says "unpaired") -->
+<section id="pair-view" class="view" hidden>
+  <header class="bar"><h1>Pair this phone</h1></header>
+  <form id="pair-form" class="pair">
+    <p class="muted">On the Mac, in the cockpit folder, run <code>npm run pair</code> and type the code here. It works once and expires in 10 minutes.</p>
+    <input id="pair-code" inputmode="text" autocapitalize="characters" autocomplete="one-time-code" autocorrect="off" spellcheck="false" maxlength="12" placeholder="ABCD-EFGH" required>
+    <button class="primary" type="submit">Pair</button>
+    <p id="pair-err" class="warn"></p>
+  </form>
+</section>
+
 <!-- New session sheet -->
 <section id="new-view" class="view" hidden>
   <header class="bar">
@@ -46,21 +57,34 @@
   </div>
 </section>
 
-<!-- Terminal -->
+<!-- Session -->
 <section id="term-view" class="view" hidden>
   <header class="bar">
     <button class="back" data-go="list">‹</button>
     <div class="title"><span id="t-name"></span><span id="t-status" class="pill"></span></div>
-    <button id="hist-btn">History</button>
+    <button id="mode-btn">Live</button>
     <button id="kill-btn" class="danger">End</button>
   </header>
-  <div id="term"></div>
-  <pre id="history" hidden></pre>
+  <div class="stage">
+    <pre id="reader" tabindex="0"></pre>
+    <div id="term" hidden></div>
+    <button id="to-bottom" class="float" hidden>↓ Latest</button>
+    <div id="conn-note" class="note" hidden></div>
+  </div>
   <div class="keys" id="keys"></div>
+  <div id="attach-row" hidden></div>
   <form id="input-row" class="input-row" autocomplete="off">
-    <textarea id="input" rows="1" placeholder="Type or dictate, then Send"></textarea>
+    <button type="button" id="attach-btn" class="icon" aria-label="Attach photo or file">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.5l-8.6 8.6a5.5 5.5 0 0 1-7.8-7.8l9.2-9.2a3.7 3.7 0 0 1 5.2 5.2l-9.2 9.2a1.8 1.8 0 0 1-2.6-2.6l8.5-8.5"/></svg>
+    </button>
+    <textarea id="input" rows="1" placeholder="Message"></textarea>
+    <button type="button" id="mic-btn" class="icon mic" aria-label="Dictate" hidden>
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+      <span id="mic-label"></span>
+    </button>
     <button class="primary" type="submit">Send</button>
   </form>
+  <input type="file" id="file" multiple hidden>
 </section>
 
 <script src="/vendor/xterm.js"></script>

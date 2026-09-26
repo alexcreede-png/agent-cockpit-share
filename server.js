@@ -10,6 +10,9 @@ const tmux = require('./lib/tmux');
 const guard = require('./lib/guard');
 const { classify } = require('./lib/status');
 const { prepareSocket, lockSocket } = require('./lib/socket');
+const pairing = require('./lib/pairing');
+const uploads = require('./lib/uploads');
+const voice = require('./lib/transcribe');
 const config = require('./lib/config').load();
 
 const PORT = config.port;
@@ -22,7 +25,7 @@ const CFG = {
   allowLocal: config.allowLocal,
 };
 const NOTIFY = config.notify && !!config.notifyCommand;
-tmux.configure({ sessionClosedCommand: config.sessionClosedCommand });
+tmux.configure({ sessionClosedCommand: config.sessionClosedCommand, uploadsDir: config.uploadsDir });
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -106,7 +109,8 @@ async function handle(req, res) {
   }
   if (req.method === 'GET' && p === '/api/state') {
     const sessions = (await tmux.list()).map((s) => ({ ...s, status: statusOf.get(s.name) || (s.dead ? 'exited' : 'idle') }));
-    return send(res, 200, { lanes: Object.keys(tmux.LANES), sessions, notify: NOTIFY, projectsRoot: config.projectsRoot });
+    return send(res, 200, { lanes: Object.keys(tmux.LANES), sessions, notify: NOTIFY, projectsRoot: config.projectsRoot,
+      transcribe: !!config.transcribeCommand, uploadMaxMB: config.uploadMaxMB });
   }
   if (req.method === 'GET' && p === '/api/projects') return send(res, 200, guard.listProjects(config));
 
@@ -121,7 +125,14 @@ async function handle(req, res) {
     return send(res, 200, { name });
   }
 
-  const m = p.match(/^\/api\/sessions\/([^/]+)\/(keys|end|history)$/);
+  if (req.method === 'POST' && p === '/api/transcribe') {
+    if (!config.transcribeCommand) return send(res, 404, { error: 'transcription not configured' });
+    const text = await voice.fromRequest(req, { dir: config.uploadsDir, command: config.transcribeCommand, maxBytes: 25 << 20 });
+    log('transcribed', text.length, 'chars');
+    return send(res, 200, { text });
+  }
+
+  const m = p.match(/^\/api\/sessions\/([^/]+)\/(keys|end|history|upload|size)$/);
   if (m) {
     const s = await requireSession(m[1]);
     if (!s) return send(res, 404, { error: 'no such session' });
@@ -139,6 +150,18 @@ async function handle(req, res) {
       else return send(res, 400, { error: 'text or key required' });
       return send(res, 200, { ok: true });
     }
+    if (req.method === 'POST' && m[2] === 'upload') {
+      const saved = await uploads.save(req, { dir: config.uploadsDir, session: s.name,
+        filename: decodeURIComponent(req.headers['x-filename'] || ''), maxBytes: config.uploadMaxMB * 1048576 });
+      log('upload', s.name, saved.bytes, 'bytes');
+      return send(res, 200, saved);
+    }
+    if (req.method === 'POST' && m[2] === 'size') {
+      const body = await readJson(req);
+      const cols = Math.min(Math.max(body.cols | 0, 20), 400), rows = Math.min(Math.max(body.rows | 0, 5), 200);
+      await tmux.resize(s.name, cols, rows);
+      return send(res, 200, { cols, rows });
+    }
     if (req.method === 'POST' && m[2] === 'end') {
       await tmux.kill(s.name);
       log('ended', s.name);
@@ -148,10 +171,29 @@ async function handle(req, res) {
   send(res, 404, { error: 'not found' });
 }
 
+const devices = config.pairing ? pairing.store(config.stateDir) : null;
+const paired = (req) => !devices || devices.check(pairing.readCookie(req));
+
+// Trade a one-time code (from `npm run pair` on the Mac) for a device cookie.
+async function pair(req, res) {
+  const body = await readJson(req);
+  const token = devices.redeem(body.code, req.headers['user-agent']);
+  if (!token) { log('pair failed'); return send(res, 403, { error: 'wrong or expired code' }); }
+  log('paired a device');
+  res.setHeader('Set-Cookie', pairing.cookieHeader(token, !CFG.localHosts.includes(req.headers.host)));
+  return send(res, 200, { ok: true });
+}
+
 const server = http.createServer((req, res) => {
   const refused = guard.checkRequest(req, CFG);
   if (refused) { log('refused', refused, req.method, req.url.split('?')[0]); return send(res, 403, { error: 'forbidden' }); }
-  handle(req, res).catch((e) => { log('error', e.message); if (!res.headersSent) send(res, 500, { error: e.message }); });
+  const p = req.url.split('?')[0];
+  if (devices && req.method === 'POST' && p === '/api/pair') {
+    return pair(req, res).catch((e) => { log('error', e.message); if (!res.headersSent) send(res, 400, { error: e.message }); });
+  }
+  // The page and its scripts are public code; everything else needs a paired device.
+  if (!(req.method === 'GET' && STATIC[p]) && !paired(req)) { log('unpaired', req.method, p); return send(res, 401, { error: 'unpaired' }); }
+  handle(req, res).catch((e) => { log('error', e.message); if (!res.headersSent) send(res, e.status || 500, { error: e.message }); });
 });
 
 // ---------- live terminal over WebSocket ----------
@@ -160,8 +202,9 @@ server.on('upgrade', async (req, socket, head) => {
   const refused = guard.checkRequest(req, CFG);
   const url = new URL(req.url, 'http://x');
   const name = url.searchParams.get('name');
-  if (refused || url.pathname !== '/ws/attach' || !(await requireSession(name).catch(() => null))) {
-    log('ws refused', refused || 'bad-target');
+  const reason = refused || (!paired(req) && 'unpaired');
+  if (reason || url.pathname !== '/ws/attach' || !(await requireSession(name).catch(() => null))) {
+    log('ws refused', reason || 'bad-target');
     socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); return socket.destroy();
   }
   wss.handleUpgrade(req, socket, head, (ws) => attach(ws, name, url));
@@ -185,7 +228,7 @@ function attach(ws, name, url) {
 }
 
 const where = config.socketPath ? `unix:${config.socketPath}` : `127.0.0.1:${PORT}`;
-const ready = () => log(`cockpit on ${where} public=${PUBLIC_HOST} notify=${NOTIFY} local=${CFG.allowLocal}`);
+const ready = () => log(`cockpit on ${where} public=${PUBLIC_HOST} notify=${NOTIFY} local=${CFG.allowLocal} pairing=${!!devices}`);
 if (config.socketPath) {
   prepareSocket(config.socketPath);
   server.listen(config.socketPath, () => { lockSocket(config.socketPath); ready(); });
