@@ -1,7 +1,7 @@
 {
   "user": "you@example.com",
   "publicHost": "your-mac.your-tailnet.ts.net:8444",
-  "socketPath": "/Users/you/.agent-cockpit/cockpit.sock",
+  "socketPath": "",
   "projectsRoot": "/Users/you/projects",
   "forbiddenPaths": ["/Users/you/projects/secret-stuff"],
   "notifyCommand": [],

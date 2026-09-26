@@ -5,7 +5,7 @@ Each session is a real terminal in a private tmux server; the phone gets a live 
 keys, a message box (use keyboard dictation for voice), and a "needs you" status when an agent is
 waiting on an approval.
 
-It is a remote shell into your Mac, so it listens only on a private Unix socket (or loopback) and
+It is a remote shell into your Mac, so it listens only on loopback (or a private Unix socket) and
 is reached through [Tailscale](https://tailscale.com) `serve`, which proves who you are on every
 request. Read **Security** below before you run it.
 
@@ -41,7 +41,7 @@ request. Read **Security** below before you run it.
    | --- | --- |
    | `user` | Your Tailscale login (the only identity allowed in). Required. |
    | `publicHost` | `host:port` your phone will use, e.g. `my-mac.tail1234.ts.net:8444`. Required. |
-   | `socketPath` | Recommended. Absolute path of a Unix socket to listen on instead of TCP, e.g. `/Users/you/.agent-cockpit/cockpit.sock`. Its folder is created owner-only. |
+   | `socketPath` | Optional. Absolute path of an owner-only Unix socket to listen on instead of TCP. Only works with the open-source `tailscaled`, not the Mac app; see **Security**. |
    | `projectsRoot` | Folder whose subfolders are offered as projects. Default `~/projects`. |
    | `forbiddenPaths` | Folders the cockpit must never open or list (e.g. work or client data). |
    | `notifyCommand` | Optional alert command; the message is appended as the last argument, e.g. `["/usr/local/bin/my-notify"]`. Enabled with `COCKPIT_NOTIFY=1`. |
@@ -50,16 +50,14 @@ request. Read **Security** below before you run it.
    `cockpit.config.json` is gitignored. `COCKPIT_SOCKET`, `COCKPIT_PORT` (TCP mode, default 8826),
    `COCKPIT_USER` and `COCKPIT_PUBLIC_HOST` environment variables override the file.
 
-3. Start the server and publish it to your tailnet only (8444 must match `publicHost`; the socket
-   path must match `socketPath`):
+3. Start the server and publish it to your tailnet only (8444 must match `publicHost`):
 
    ```bash
    node server.js
-   tailscale serve --bg --https=8444 unix:/Users/you/.agent-cockpit/cockpit.sock
+   tailscale serve --bg --https=8444 http://127.0.0.1:8826
    ```
 
-   Without `socketPath` the server uses TCP instead: `tailscale serve --bg --https=8444
-   http://127.0.0.1:8826`. Read **Security** first.
+   With `socketPath` set, use `unix:<socketPath>` in place of `http://127.0.0.1:8826`.
 
 4. On the phone open `https://<publicHost>` and use Share → Add to Home Screen for an app icon.
 
@@ -71,10 +69,15 @@ agents started from the phone reach your login Keychain (for `gh`, `git push`, e
 
 Anyone who gets through the cockpit can run any command as you. Know these limits:
 
-- **Use `socketPath` (Unix-socket mode).** In TCP mode the server is on `127.0.0.1`, which every
-  program and every other user account on the Mac can reach, and any of them can fake the
-  Tailscale identity headers. The Unix socket is readable only by your account; Tailscale's
-  system service runs as root and can still reach it.
+- **Loopback is shared by everyone on the Mac.** In the default TCP mode the server is on
+  `127.0.0.1`, which every program and every other user account on the Mac can reach, and any of
+  them can fake the Tailscale identity headers. On a Mac with only your account this adds little
+  (those programs already run as you). **If the Mac has other user accounts, don't run it in TCP
+  mode.**
+- `socketPath` closes that gap with an owner-only Unix socket, but the Tailscale Mac apps (App
+  Store and standalone) can't proxy to Unix sockets: `serve` answers 502 even for a world-readable
+  socket (tested). It should work with the open-source `tailscaled` daemon running as root
+  (untested).
 - **Never use `tailscale funnel`** for this. Funnel puts it on the public internet. Use `serve`,
   which is tailnet-only.
 - The only identity allowed in is `user`. Anyone else who can sign in as that Tailscale account
