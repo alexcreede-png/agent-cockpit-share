@@ -66,3 +66,10 @@ test('cookie parsing and flags', () => {
   for (const f of ['HttpOnly', 'SameSite=Strict', 'Secure', 'Path=/']) assert.ok(c.includes(f), f);
   assert.ok(!pairing.cookieHeader('tok', false).includes('Secure'));
 });
+test('token can come from header, websocket subprotocol, or cookie', () => {
+  assert.equal(pairing.readToken({ headers: { 'x-cockpit-device': 'abc_DEF-1' } }), 'abc_DEF-1');
+  assert.equal(pairing.readToken({ headers: { 'sec-websocket-protocol': 'cockpit, dev.tok_EN-2' } }), 'tok_EN-2');
+  assert.equal(pairing.readToken({ headers: { cookie: 'cockpit_device=cook-3' } }), 'cook-3');
+  assert.equal(pairing.readToken({ headers: { 'x-cockpit-device': 'bad token!' } }), null);
+  assert.equal(pairing.readToken({ headers: {} }), null);
+});

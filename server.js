@@ -78,11 +78,15 @@ const STATIC = {
   '/vendor/addon-fit.js': [path.join(NM, '@xterm/addon-fit/lib/addon-fit.js'), 'text/javascript'],
 };
 
+const FRAME_ANCESTORS = config.frameAncestors.length ? config.frameAncestors.join(' ') : "'none'";
+const CSP = "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; " +
+  `frame-ancestors ${FRAME_ANCESTORS}`;
+
 function send(res, code, body, type = 'application/json') {
   const buf = Buffer.isBuffer(body) ? body : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
   res.writeHead(code, { 'Content-Type': type, 'Content-Length': buf.length, 'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
-    'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'" });
+    'Content-Security-Policy': CSP });
   res.end(buf);
 }
 
@@ -172,7 +176,7 @@ async function handle(req, res) {
 }
 
 const devices = config.pairing ? pairing.store(config.stateDir) : null;
-const paired = (req) => !devices || devices.check(pairing.readCookie(req));
+const paired = (req) => !devices || devices.check(pairing.readToken(req));
 
 // Trade a one-time code (from `npm run pair` on the Mac) for a device cookie.
 async function pair(req, res) {
@@ -181,7 +185,8 @@ async function pair(req, res) {
   if (!token) { log('pair failed'); return send(res, 403, { error: 'wrong or expired code' }); }
   log('paired a device');
   res.setHeader('Set-Cookie', pairing.cookieHeader(token, !CFG.localHosts.includes(req.headers.host)));
-  return send(res, 200, { ok: true });
+  // Also returned so a framed page (where the cookie is blocked) can keep it itself.
+  return send(res, 200, { ok: true, token });
 }
 
 const server = http.createServer((req, res) => {
@@ -197,7 +202,9 @@ const server = http.createServer((req, res) => {
 });
 
 // ---------- live terminal over WebSocket ----------
-const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 });
+// Browsers that offer subprotocols need one echoed back; "cockpit" is ours (the other carries the token).
+const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20,
+  handleProtocols: (protocols) => (protocols.has('cockpit') ? 'cockpit' : false) });
 server.on('upgrade', async (req, socket, head) => {
   const refused = guard.checkRequest(req, CFG);
   const url = new URL(req.url, 'http://x');

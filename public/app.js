@@ -9,9 +9,22 @@ let state = { lanes: [], sessions: [] };
 let current = null;          // session name open in the terminal view
 let term, fit, ws, pollTimer;
 
+// Paired-device token. Normally a cookie carries it; inside another site's frame (e.g. a dashboard app)
+// the browser blocks that cookie, so the page keeps the token and sends it as a header.
+const DEVICE_KEY = 'cockpit-device';
+const device = {
+  get() { try { return localStorage.getItem(DEVICE_KEY) || ''; } catch { return ''; } },
+  set(v) { try { v ? localStorage.setItem(DEVICE_KEY, v) : localStorage.removeItem(DEVICE_KEY); } catch {} },
+};
+const authHeaders = () => (device.get() ? { 'X-Cockpit-Device': device.get() } : {});
+
 async function api(path, opts = {}) {
-  const res = await fetch(path, { ...opts, headers: { 'Content-Type': 'application/json' } });
-  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.status);
+  const res = await fetch(path, { ...opts, headers: { 'Content-Type': 'application/json', ...authHeaders() } });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))).error || res.status;
+    if (err === 'unpaired') device.set('');
+    throw new Error(err);
+  }
   return (res.headers.get('content-type') || '').includes('json') ? res.json() : res.text();
 }
 const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body || {}) });
@@ -77,7 +90,8 @@ $('#pair-form').onsubmit = async (ev) => {
   ev.preventDefault();
   $('#pair-err').textContent = '';
   try {
-    await post('/api/pair', { code: $('#pair-code').value });
+    const r = await post('/api/pair', { code: $('#pair-code').value });
+    device.set(r.token);
     location.reload();
   } catch (e) {
     $('#pair-err').textContent = e.message === 'unpaired' ? 'Not paired.' : 'Wrong or expired code. Run npm run pair again.';
@@ -230,7 +244,9 @@ function startLive() {
 function connect(name) {
   if (current !== name || mode !== 'live' || !term) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const sock = new WebSocket(`${proto}://${location.host}/ws/attach?name=${encodeURIComponent(name)}&cols=${term.cols}&rows=${term.rows}`);
+  const tok = device.get();
+  const sock = new WebSocket(`${proto}://${location.host}/ws/attach?name=${encodeURIComponent(name)}&cols=${term.cols}&rows=${term.rows}`,
+    tok ? ['cockpit', 'dev.' + tok] : undefined);
   ws = sock;
   sock.onopen = () => { wsRetry = 0; note(''); lastSize = ''; fitSession(); };
   sock.onmessage = (e) => term && term.write(e.data);
@@ -332,6 +348,7 @@ function upload(name, file, onProgress) {
   return new Promise((resolve, reject) => {
     const x = new XMLHttpRequest();
     x.open('POST', `/api/sessions/${name}/upload`);
+    for (const [k, v] of Object.entries(authHeaders())) x.setRequestHeader(k, v);
     x.setRequestHeader('X-Filename', encodeURIComponent(file.name || 'photo.jpg'));
     x.setRequestHeader('Content-Type', 'application/octet-stream');
     x.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(Math.round(100 * e.loaded / e.total)); };
@@ -379,7 +396,7 @@ $('#mic-btn').onclick = async () => {
     if (!current || !blob.size) return micState('idle');
     micState('busy');
     try {
-      const res = await fetch('/api/transcribe', { method: 'POST', headers: { 'Content-Type': blob.type }, body: blob });
+      const res = await fetch('/api/transcribe', { method: 'POST', headers: { 'Content-Type': blob.type, ...authHeaders() }, body: blob });
       const b = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(b.error || `HTTP ${res.status}`);
       if (b.text) { const i = $('#input'); i.value = (i.value.trim() ? i.value.trim() + ' ' : '') + b.text; grow(); }

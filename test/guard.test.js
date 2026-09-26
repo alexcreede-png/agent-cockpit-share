@@ -69,6 +69,9 @@ test('config requires a user and a public host', () => {
   fs.writeFileSync(f, JSON.stringify({ user: USER, publicHost: PUB, socketPath: '/s/c.sock' }));
   assert.equal(load(f, {}).socketPath, '/s/c.sock');
   assert.equal(load(f, { COCKPIT_SOCKET: '' }).socketPath, '');
+  fs.writeFileSync(f, JSON.stringify({ user: USER, publicHost: PUB,
+    frameAncestors: ['https://dash.example.com', 'http://insecure.example.com', "'unsafe-inline'", 'https://ok.example.com:8443'] }));
+  assert.deepEqual(load(f, {}).frameAncestors, ['https://dash.example.com', 'https://ok.example.com:8443']);
 });
 test('session names are validated', () => {
   assert.ok(g.validSessionName('claude-agent-cockpit-1a2b'));

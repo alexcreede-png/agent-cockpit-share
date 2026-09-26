@@ -4,6 +4,7 @@
   "socketPath": "",
   "projectsRoot": "/Users/you/projects",
   "forbiddenPaths": ["/Users/you/projects/secret-stuff"],
+  "frameAncestors": [],
   "notifyCommand": [],
   "sessionClosedCommand": "",
   "uploadsDir": "",

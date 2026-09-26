@@ -49,6 +49,7 @@ request. Read **Security** below before you run it.
    | `uploadsDir` | Where files sent from the phone are saved, one folder per session. Default `state/uploads` in this folder. Claude and Codex sessions get their own folder via `--add-dir`, so they can read uploads without a permission prompt. |
    | `uploadMaxMB` | Largest upload accepted. Default 200. |
    | `stateDir` | Owner-only folder for paired devices and pending pair codes. Default `~/.agent-cockpit`. |
+   | `frameAncestors` | Sites allowed to show the cockpit inside a frame (e.g. your own dashboard), as `https://host` origins. Default none. Inside a frame the browser blocks the cookie, so the page keeps its device token and sends it as a header instead; pair once inside the frame. |
    | `pairing` | Default `true`: every phone pairs once before it can do anything. Set `false` (or `COCKPIT_PAIRING=0`) only for local testing. |
    | `transcribeCommand` | Optional speech-to-text command for the 🎤 button; the audio file path is appended and the text is read from stdout. `lib/whisper_transcribe.py` works with any Python that has `mlx_whisper` (Apple silicon) and `ffmpeg` on `PATH`; model via `COCKPIT_WHISPER_MODEL`. Without it the mic button is hidden. |
 
