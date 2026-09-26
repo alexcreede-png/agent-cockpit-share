@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Cockpit">
+<meta name="theme-color" content="#0f1115">
+<title>Agent Cockpit</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="stylesheet" href="/vendor/xterm.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<!-- Session list -->
+<section id="list-view" class="view">
+  <header class="bar">
+    <h1>Cockpit</h1>
+    <span id="summary" class="muted"></span>
+    <button id="new-btn" class="primary">+ New</button>
+  </header>
+  <ul id="sessions"></ul>
+  <p id="empty" class="muted center" hidden>No sessions yet. Tap <b>+ New</b> to start one.</p>
+  <p id="conn" class="warn center" hidden>Can't reach the Mac.</p>
+</section>
+
+<!-- New session sheet -->
+<section id="new-view" class="view" hidden>
+  <header class="bar">
+    <button class="back" data-go="list">‹ Back</button>
+    <h1>New session</h1>
+  </header>
+  <div class="form">
+    <label>Lane</label>
+    <div id="lanes" class="chips"></div>
+    <label for="project-filter">Project</label>
+    <input id="project-filter" placeholder="Filter projects…" autocomplete="off" autocapitalize="off">
+    <ul id="projects" class="pick"></ul>
+    <label for="prompt">First message (optional)</label>
+    <textarea id="prompt" rows="3" placeholder="What should it do? Dictation works here."></textarea>
+    <button id="start-btn" class="primary wide" disabled>Start</button>
+    <p id="new-err" class="warn"></p>
+  </div>
+</section>
+
+<!-- Terminal -->
+<section id="term-view" class="view" hidden>
+  <header class="bar">
+    <button class="back" data-go="list">‹</button>
+    <div class="title"><span id="t-name"></span><span id="t-status" class="pill"></span></div>
+    <button id="hist-btn">History</button>
+    <button id="kill-btn" class="danger">End</button>
+  </header>
+  <div id="term"></div>
+  <pre id="history" hidden></pre>
+  <div class="keys" id="keys"></div>
+  <form id="input-row" class="input-row" autocomplete="off">
+    <textarea id="input" rows="1" placeholder="Type or dictate, then Send"></textarea>
+    <button class="primary" type="submit">Send</button>
+  </form>
+</section>
+
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/addon-fit.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
