@@ -17,7 +17,7 @@ const output = Array.from({ length: 90 }, (_, i) => `Output line ${i + 1}: reada
 let fixture;
 function reset() {
   fixture = { offline: false, endError: false, sendError: false, projectError: false, uploadPending: null,
-    holdUpload: false, holdSend: false, sendPending: null, transcribePending: null, sent: [], sessions: names.map((name, i) => ({ name, lane: i ? 'grok' : 'codex', project: `/example/${i ? 'beta' : 'alpha'}`, created: Date.now(), status: i ? 'needs-you' : 'idle' })) };
+    holdUpload: false, holdSend: false, sendPending: null, transcribePending: null, connections: [], sent: [], sessions: names.map((name, i) => ({ name, lane: i ? 'grok' : 'codex', project: `/example/${i ? 'beta' : 'alpha'}`, created: Date.now(), status: i ? 'needs-you' : 'idle' })) };
 }
 const files = {
   '/': ['public/index.html', 'text/html; charset=utf-8'],
@@ -69,8 +69,10 @@ const server = http.createServer(async (req, res) => {
   return reply(200, { ok: true });
 });
 const terminalServer = new WebSocketServer({ server, path: '/ws/attach' });
-terminalServer.on('connection', socket => {
-  socket.send('\r\nSynthetic live terminal ready\r\n');
+terminalServer.on('connection', (socket, request) => {
+  socket.sessionName = new URL(request.url, 'http://localhost').searchParams.get('name');
+  fixture.connections.push(socket);
+  socket.send(`Synthetic live terminal: ${socket.sessionName}\r\n`);
   socket.on('message', raw => { const msg = JSON.parse(raw); if (msg.t === 'in') socket.send('Input received\r\n'); });
 });
 const pause = ms => new Promise(r => setTimeout(r, ms));
@@ -147,6 +149,23 @@ async function run(engineName, engine) {
     assert.ok(await frame.locator('#delivery.error').isVisible(), 'failed end is visible');
     fixture.endError = false;
     await frame.locator('#mode-btn').click(); await frame.locator('#term .xterm-screen').waitFor();
+    await waitUntil(() => fixture.connections.length > 0, 'live terminal attachment');
+    const beforeReconnect = fixture.connections.length;
+    fixture.connections.at(-1).terminate();
+    await waitUntil(() => fixture.connections.length > beforeReconnect, 'active socket reconnect');
+    await frame.locator('#connection-state[data-state="connected"]').waitFor();
+    assert.equal([...terminalServer.clients].filter(socket => socket.readyState === 1).length, 1, 'one active socket after reconnect');
+    await frame.locator('[data-go="list"]:visible').click(); await beta().click();
+    await waitUntil(() => fixture.connections.at(-1).sessionName === names[1], 'new session socket');
+    await waitUntil(async () => frame.locator('#term').evaluate(() => {
+      const buffer = term.buffer.active;
+      return Array.from({ length: buffer.length }, (_, i) => buffer.getLine(i)?.translateToString() || '').join('').includes('grok-example-project-beta-5678');
+    }), 'new session output');
+    assert.equal(await frame.locator('#term').evaluate(() => {
+      const buffer = term.buffer.active;
+      return Array.from({ length: buffer.length }, (_, i) => buffer.getLine(i)?.translateToString() || '').join('').includes('codex-example-project-alpha-1234');
+    }), false, 'previous session output never appears in new terminal');
+    await frame.locator('[data-go="list"]:visible').click(); await alpha().click();
     await frame.locator('#mode-btn').click(); await frame.locator('#reader').waitFor({state:'visible'});
     await frame.locator('#reader').filter({hasText:'Output line 90'}).waitFor();
     await frame.locator('#reader').evaluate(el => { el.scrollTop = 50; }); await pause(1700);
@@ -176,7 +195,7 @@ async function run(engineName, engine) {
     fixture.offline = false; await pause(3300);
     assert.doesNotMatch(await frame.locator('#connection-state').innerText(), /offline|lost/i);
     assert.deepEqual(errors, []);
-    console.log(`${engineName}: keyboard/focus, drafts, delayed upload, failed send/end, scroll, responsive layouts and new-session flow PASS`);
+    console.log(`${engineName}: keyboard/focus, drafts, delayed upload, failed send/end, scroll, live reconnect/session isolation, responsive layouts and new-session flow PASS`);
   } finally { await browser.close(); }
 }
 (async () => {

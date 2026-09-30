@@ -269,6 +269,7 @@ const store = {
 let mode = store.get('cockpit-mode') || ((framed || touch) ? 'read' : 'live');
 let readerEpoch = 0, readerBusy = false;
 let readTimer = null, lastText = '', lastSize = '', wsRetry = 0, wsTimer = null;
+let liveEpoch = 0;
 // Session names come from the server. Composer data remains in memory for this page only.
 const composers = new Map();
 const composer = (name) => {
@@ -382,38 +383,59 @@ new ResizeObserver(() => {
 }).observe($('#reader'));
 
 // --- live terminal (reconnects by itself)
+const liveActive = (name, terminal, epoch) =>
+  current === name && mode === 'live' && term === terminal && liveEpoch === epoch;
 function startLive() {
+  const name = current, epoch = ++liveEpoch;
   connection('reconnecting');
   term = new Terminal({ fontSize: touch ? 11 : 13, fontFamily: 'ui-monospace, Menlo, monospace',
     theme: { background: '#0f1115' }, cursorBlink: false, scrollback: 5000, disableStdin: touch });
+  const terminal = term;
   fit = new FitAddon.FitAddon();
-  term.loadAddon(fit);
-  term.open($('#term'));
+  terminal.loadAddon(fit);
+  terminal.open($('#term'));
   fit.fit();
-  term.onData((d) => ws && ws.readyState === 1 && ws.send(JSON.stringify({ t: 'in', d })));
+  terminal.onData((d) => {
+    if (!liveActive(name, terminal, epoch)) return;
+    const sock = ws;
+    if (sock && sock.readyState === 1) sock.send(JSON.stringify({ t: 'in', d }));
+  });
   wsRetry = 0;
-  connect(current);
+  connect(name, terminal, epoch);
 }
-function connect(name) {
-  if (current !== name || mode !== 'live' || !term) return;
+function connect(name, terminal = term, epoch = liveEpoch) {
+  if (!liveActive(name, terminal, epoch) || (ws && ws.readyState < 2)) return;
+  clearTimeout(wsTimer);
+  wsTimer = null;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const tok = device.get();
-  const sock = new WebSocket(`${proto}://${location.host}/ws/attach?name=${encodeURIComponent(name)}&cols=${term.cols}&rows=${term.rows}`,
+  const sock = new WebSocket(`${proto}://${location.host}/ws/attach?name=${encodeURIComponent(name)}&cols=${terminal.cols}&rows=${terminal.rows}`,
     tok ? ['cockpit', 'dev.' + tok] : undefined);
+  const activeSocket = () => liveActive(name, terminal, epoch) && ws === sock;
   ws = sock;
-  sock.onopen = () => { wsRetry = 0; note(''); connection('connected'); lastSize = ''; fitSession(); };
-  sock.onmessage = (e) => term && term.write(e.data);
+  sock.onopen = () => {
+    if (!activeSocket()) return;
+    wsRetry = 0; note(''); connection('connected'); lastSize = ''; fitSession();
+  };
+  sock.onmessage = (e) => { if (activeSocket()) terminal.write(e.data); };
   sock.onclose = () => {
-    if (ws !== sock || current !== name || mode !== 'live') return;
+    if (!activeSocket()) return;
     ws = null;
     note('Reconnecting…');
     connection('reconnecting');
-    wsTimer = setTimeout(() => connect(name), Math.min(1000 * 2 ** wsRetry++, 10000));
+    const timer = setTimeout(() => {
+      if (!liveActive(name, terminal, epoch) || wsTimer !== timer) return;
+      wsTimer = null;
+      connect(name, terminal, epoch);
+    }, Math.min(1000 * 2 ** wsRetry++, 10000));
+    wsTimer = timer;
   };
 }
 function stopLive() {
+  liveEpoch++;
   clearTimeout(wsTimer);
-  if (ws) { const s = ws; ws = null; s.onclose = null; s.close(); }
+  wsTimer = null;
+  if (ws) { const s = ws; ws = null; s.onopen = s.onmessage = s.onclose = null; s.close(); }
   if (term) { term.dispose(); term = null; $('#term').replaceChildren(); }
   note('');
 }
