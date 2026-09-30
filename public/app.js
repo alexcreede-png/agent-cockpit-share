@@ -302,6 +302,7 @@ function openTerm(name, session = state.sessions.find((s) => s.name === name)) {
 function closeTerm() {
   if (current) composer(current).draft = $('#input').value;
   current = null;
+  closeShortKeys(false);
   if (rec && rec.state === 'recording') rec.stop();
   stopReader(); stopLive();
 }
@@ -476,9 +477,12 @@ $('#keys').replaceChildren(...QUICK_KEYS.map(([label, key], index) => {
   b.type = 'button'; b.textContent = label;
   b.setAttribute('aria-label', key === 'Enter' ? 'Submit current terminal input' : key);
   if (index > 3) b.className = 'extra-key';
-  b.onclick = () => current && post(`/api/sessions/${current}/keys`, { key })
-    .then(() => { if (key === 'Enter') delivery('Enter sent to terminal'); setTimeout(pullReader, 300); })
-    .catch((err) => delivery('Key failed: ' + err.message, true));
+  b.onclick = () => {
+    if (current) post(`/api/sessions/${current}/keys`, { key })
+      .then(() => { if (key === 'Enter') delivery('Enter sent to terminal'); setTimeout(pullReader, 300); })
+      .catch((err) => delivery('Key failed: ' + err.message, true));
+    closeShortKeys();
+  };
   return b;
 }));
 const moreKeys = document.createElement('button');
@@ -490,6 +494,23 @@ moreKeys.onclick = () => {
   refit();
 };
 $('#keys').append(moreKeys);
+const keysToggle = $('#keys-toggle');
+function closeShortKeys(restoreFocus = true) {
+  if (!$('#keys').classList.contains('short-open')) return;
+  $('#keys').classList.remove('short-open');
+  keysToggle.setAttribute('aria-expanded', 'false');
+  keysToggle.setAttribute('aria-label', 'Show terminal keys');
+  if (restoreFocus) keysToggle.focus();
+}
+keysToggle.onclick = () => {
+  if ($('#keys').classList.contains('short-open')) closeShortKeys();
+  else {
+    $('#keys').classList.add('short-open');
+    keysToggle.setAttribute('aria-expanded', 'true');
+    keysToggle.setAttribute('aria-label', 'Hide terminal keys');
+    $('#keys button').focus();
+  }
+};
 
 function delivery(text, error = false) {
   const el = $('#delivery');

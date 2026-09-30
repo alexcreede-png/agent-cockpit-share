@@ -212,8 +212,59 @@ async function run(engineName, engine) {
     assert.match(await frame.locator('#connection-state').innerText(), /offline|retry|connect|unreachable/i);
     fixture.offline = false; await pause(3300);
     assert.doesNotMatch(await frame.locator('#connection-state').innerText(), /offline|lost/i);
+    assert.equal(await frame.locator('#keys-toggle').isVisible(), false, 'normal frame keeps the regular key row');
+    fixture.sendError = true;
+    const crowdedDraft = Array.from({ length: 9 }, (_, i) => `Draft line ${i + 1} for a short phone frame`).join('\n');
+    await frame.locator('#input').fill(crowdedDraft);
+    await frame.locator('#send-btn').click();
+    await frame.locator('#delivery.error').waitFor();
+    fixture.sendError = false;
+    await page.locator('iframe').evaluate(el => { el.style.height = '296px'; });
+    await waitUntil(async () => await frame.locator('#term-view').evaluate(el =>
+      Math.abs(el.getBoundingClientRect().height - innerHeight) < 2), 'short frame viewport sync');
+    const longFiles = [1, 2, 3].map(i => ({ name: `attachment-${i}-a-very-long-descriptive-filename-that-should-be-visible-on-the-phone.txt`,
+      mimeType: 'text/plain', buffer: Buffer.from('synthetic attachment') }));
+    await frame.locator('#file').setInputFiles(longFiles);
+    const removeButtons = frame.locator('#attach-row .chip button');
+    await waitUntil(async () => await removeButtons.count() === 3, 'three crowded attachments');
+    const shortBox = await frame.locator('#term-view').evaluate(view => {
+      const box = selector => view.querySelector(selector).getBoundingClientRect();
+      return { height: innerHeight, width: innerWidth, reader: box('#reader').height,
+        readerBottom: box('#reader').bottom, attachmentsTop: box('#attach-row').top,
+        sendBottom: box('#send-btn').bottom, scrollHeight: view.scrollHeight,
+        attachmentsScroll: view.querySelector('#attach-row').scrollWidth > view.querySelector('#attach-row').clientWidth };
+    });
+    assert.ok(shortBox.width >= 360 && shortBox.width <= 366, JSON.stringify(shortBox));
+    assert.ok(shortBox.reader >= 60, JSON.stringify(shortBox));
+    assert.ok(shortBox.readerBottom <= shortBox.attachmentsTop + 1, JSON.stringify(shortBox));
+    assert.ok(shortBox.sendBottom <= shortBox.height, JSON.stringify(shortBox));
+    assert.ok(shortBox.scrollHeight <= shortBox.height, JSON.stringify(shortBox));
+    assert.ok(shortBox.attachmentsScroll, JSON.stringify(shortBox));
+    for (let i = 0; i < 3; i++) {
+      await removeButtons.nth(i).focus();
+      assert.equal(await removeButtons.nth(i).evaluate(button => {
+        const row = button.closest('#attach-row').getBoundingClientRect();
+        const rect = button.getBoundingClientRect();
+        return document.activeElement === button && rect.left >= row.left - 1 && rect.right <= row.right + 1;
+      }), true, `attachment ${i + 1} removal is keyboard reachable`);
+    }
+    await removeButtons.last().click();
+    assert.equal(await removeButtons.count(), 2, 'last attachment removal is pointer reachable');
+    assert.equal(await frame.locator('#input').inputValue(), crowdedDraft);
+    const keysToggle = frame.locator('#keys-toggle');
+    await keysToggle.click();
+    assert.equal(await keysToggle.getAttribute('aria-expanded'), 'true');
+    await frame.locator('#keys').getByRole('button', { name: 'Escape' }).press('Enter');
+    await waitUntil(() => fixture.sent.at(-1)?.key === 'Escape', 'short-frame Escape key');
+    assert.equal(await keysToggle.getAttribute('aria-expanded'), 'false');
+    assert.equal(await keysToggle.evaluate(el => document.activeElement === el), true, 'key sheet restores focus');
+    await keysToggle.click();
+    await frame.locator('#keys').getByRole('button', { name: 'Submit current terminal input' }).click();
+    await waitUntil(() => fixture.sent.at(-1)?.key === 'Enter', 'short-frame Enter key');
+    assert.equal(await keysToggle.getAttribute('aria-expanded'), 'false');
+    await page.screenshot({ path: path.join(artifacts, `${engineName}-short-frame.png`) });
     assert.deepEqual(errors, []);
-    console.log(`${engineName}: keyboard/focus, drafts, delayed upload/timeout recovery, failed send/end, scroll, live reconnect/session isolation, responsive layouts and new-session flow PASS`);
+    console.log(`${engineName}: keyboard/focus, drafts, delayed upload/timeout recovery, failed send/end, scroll, live reconnect/session isolation, responsive layouts, crowded short frame and new-session flow PASS`);
   } finally { await browser.close(); }
 }
 (async () => {

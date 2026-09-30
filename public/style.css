@@ -68,7 +68,7 @@ button:active { opacity: .7; }
 .pick li.on { background: var(--accent); color: #fff; }
 
 /* Session: scrollable transcript (read) or live terminal, with overlays. */
-.stage { position: relative; flex: 1; min-height: 0; display: flex; background: var(--term-bg); }
+.stage { position: relative; flex: 1; min-height: 0; display: flex; overflow: hidden; background: var(--term-bg); }
 #term { flex: 1; min-width: 0; padding: 4px; overflow: hidden; }
 #reader { flex: 1; min-width: 0; margin: 0; padding: 10px 12px 48px; overflow-y: auto; overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch; color: #d1d5db; font: 12px/1.4 ui-monospace, Menlo, monospace;
@@ -193,4 +193,16 @@ button:hover:not(:disabled) { border-color: var(--accent); }
   .keys button { min-height: 34px; }
   .input-row { padding-block: 3px; }
   .input-row textarea { max-height: 72px; }
+}
+#keys-toggle { display: none; }
+@media (max-height: 400px) {
+  #term-view { position: relative; }
+  #keys { display: none; }
+  #keys-toggle { display: block; min-width: 44px; padding-inline: 6px; font-size: 12px; }
+  #keys.short-open { display: flex; position: absolute; z-index: 5; top: 0; left: 0; right: 0;
+    max-height: min(135px, 48dvh); overflow: auto; flex-wrap: wrap; padding: 8px;
+    border-bottom: 1px solid var(--line); box-shadow: 0 4px 12px #0008; }
+  #attach-row { flex-wrap: nowrap; overflow-x: auto; overscroll-behavior-x: contain; }
+  #attach-row .chip { flex: 0 0 auto; max-width: min(280px, 85vw); }
+  .input-row textarea { max-height: 48px; }
 }
