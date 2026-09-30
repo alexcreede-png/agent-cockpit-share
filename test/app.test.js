@@ -12,11 +12,12 @@ test('public/app.js compiles as a script', () => {
   assert.doesNotThrow(() => new vm.Script(src, { filename: 'app.js' }));
 });
 
-function frontend({ failSend = false, failEnd = false, voiceStall = false, voiceBodyStall = false } = {}) {
+function frontend({ failSend = false, failEnd = false, voiceStall = false, voiceBodyStall = false, history = '' } = {}) {
   class Element {
     constructor() {
       this.children = []; this.dataset = {}; this.style = {}; this.value = ''; this.hidden = false;
-      this.textContent = ''; this.className = ''; this.clientWidth = 0; this.scrollHeight = 0;
+      this.textContent = ''; this.className = ''; this.clientWidth = 0; this.clientHeight = 0;
+      this.scrollHeight = 0; this.scrollTop = 0; this.listeners = {};
       this.classList = {
         add: (c) => { this.className = [...new Set([...this.className.split(' '), c])].join(' ').trim(); },
         remove: (c) => { this.className = this.className.split(' ').filter((x) => x !== c).join(' '); },
@@ -32,7 +33,8 @@ function frontend({ failSend = false, failEnd = false, voiceStall = false, voice
     append(...nodes) { this.children.push(...nodes); }
     remove() {}
     setAttribute(k, v) { this[k] = v; }
-    addEventListener() {}
+    addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
+    fire(type, event = {}) { for (const fn of this.listeners[type] || []) fn(event); }
     click() { return this.onclick?.(); }
   }
   const elements = new Map();
@@ -41,7 +43,8 @@ function frontend({ failSend = false, failEnd = false, voiceStall = false, voice
     querySelector: (s) => el(s), querySelectorAll: () => [], createElement: () => new Element(),
     documentElement: { dataset: {}, style: { setProperty() {} } }, addEventListener() {},
   };
-  const calls = [], uploads = [], terminals = [], sockets = [], timers = [];
+  const calls = [], uploads = [], terminals = [], sockets = [], timers = [], observers = [];
+  let historyText = history;
   let finishSend;
   class XHR {
     constructor() { this.upload = {}; uploads.push(this); }
@@ -83,7 +86,10 @@ function frontend({ failSend = false, failEnd = false, voiceStall = false, voice
     Terminal: FakeTerminal, WebSocket: FakeSocket, FitAddon: { FitAddon: class { fit() {} } },
     AbortController,
     location: { hash: '', protocol: 'https:', host: 'example.test' }, history: { replaceState() {} },
-    localStorage: { getItem: () => null, setItem() {} }, ResizeObserver: class { observe() {} },
+    localStorage: { getItem: () => null, setItem() {} }, ResizeObserver: class {
+      constructor(fn) { this.fn = fn; observers.push(this); }
+      observe(element) { this.element = element; }
+    },
     setTimeout: (fn, ms) => { timers.push({ fn, ms, canceled: false }); return timers.length; },
     clearTimeout(id) { if (timers[id - 1]) timers[id - 1].canceled = true; },
     setInterval: () => 1, clearInterval() {},
@@ -103,14 +109,74 @@ function frontend({ failSend = false, failEnd = false, voiceStall = false, voice
       const failed = (failSend && path === '/api/sessions/a/keys') || (failEnd && path === '/api/sessions/a/end');
       return { ok: !failed, status: failed ? 503 : 200,
         headers: { get: () => path.includes('/history') ? 'text/plain' : 'application/json' },
-        json: async () => failed ? { error: 'unavailable' } : body, text: async () => '' };
+        json: async () => failed ? { error: 'unavailable' } : body,
+        text: async () => path.includes('/history') ? historyText : '' };
     },
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8'), context);
-  return { context, el, calls, uploads, terminals, sockets, timers, finishSend: () => finishSend?.() };
+  return { context, el, calls, uploads, terminals, sockets, timers, observers,
+    setHistory: (text) => { historyText = text; }, finishSend: () => finishSend?.() };
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test('read view follows the tail through sparse and dense resizes, but preserves deliberate scrollback', async () => {
+  for (const history of ['Earlier output\n' + '\n'.repeat(40) + 'Prompt>',
+    Array.from({ length: 90 }, (_, i) => `Output ${i}`).join('\n')]) {
+    const h = frontend({ history });
+    const reader = h.el('#reader');
+    reader.clientHeight = 400; reader.scrollHeight = 1000;
+    await tick();
+    vm.runInContext("openTerm('a')", h.context);
+    await tick();
+    assert.equal(reader.textContent, history.includes('Earlier output')
+      ? 'Earlier output\n\n\nPrompt>' : history);
+    reader.scrollTop = 600; reader.fire('scroll');
+    const resize = () => h.observers.find((o) => o.element === reader).fn();
+
+    // WebKit may send a native scroll before ResizeObserver; it is not user scrollback.
+    reader.clientHeight = 180; reader.scrollTop = 540; reader.fire('scroll'); resize();
+    assert.equal(reader.scrollTop, 1000);
+    await vm.runInContext('pullReader()', h.context); // unchanged history
+    assert.equal(reader.scrollTop, 1000);
+
+    // Chromium may resize without a scroll event first; growing also keeps the tail.
+    reader.clientHeight = 400; reader.scrollTop = 600; resize();
+    assert.equal(reader.scrollTop, 1000);
+    reader.scrollTop = 100; reader.fire('scroll');
+    reader.clientHeight = 180; reader.fire('scroll'); resize();
+    assert.equal(reader.scrollTop, 100, 'manual scrollback survives resize');
+    await vm.runInContext('pullReader()', h.context);
+    assert.equal(reader.scrollTop, 100, 'unchanged polling preserves scrollback');
+
+    h.el('#to-bottom').click();
+    assert.equal(reader.scrollTop, 1000, 'Latest restores tail following');
+    reader.clientHeight = 400; reader.scrollTop = 600; reader.fire('scroll'); resize();
+    assert.equal(reader.scrollTop, 1000);
+  }
+});
+
+test('read view compacts only large empty-row runs and preserves content and normal spacing', async () => {
+  const history = ['  indented', '', '  ', '', 'next', '', '', '', '', '  final'].join('\n');
+  const h = frontend({ history });
+  await tick();
+  vm.runInContext("openTerm('a')", h.context);
+  await tick();
+  assert.equal(h.el('#reader').textContent,
+    ['  indented', '', '  ', '', 'next', '', '', '  final'].join('\n'));
+});
+
+test('successful empty history replaces Loading and later output appears', async () => {
+  const h = frontend({ history: '' });
+  await tick();
+  vm.runInContext("openTerm('a')", h.context);
+  await tick();
+  assert.equal(h.el('#reader').textContent, 'No output yet.');
+  assert.equal(h.el('#connection-state').textContent, 'Connected');
+  h.setHistory('First response\nPrompt>');
+  await vm.runInContext('pullReader()', h.context);
+  assert.equal(h.el('#reader').textContent, 'First response\nPrompt>');
+});
 
 test('drafts and delayed send completion stay with their original session', async () => {
   const h = frontend();

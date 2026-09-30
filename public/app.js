@@ -268,7 +268,7 @@ const store = {
 };
 let mode = store.get('cockpit-mode') || ((framed || touch) ? 'read' : 'live');
 let readerEpoch = 0, readerBusy = false;
-let readTimer = null, lastText = '', lastSize = '', wsRetry = 0, wsTimer = null;
+let readTimer = null, lastText = null, lastSize = '', wsRetry = 0, wsTimer = null;
 let liveEpoch = 0;
 // Session names come from the server. Composer data remains in memory for this page only.
 const composers = new Map();
@@ -347,6 +347,17 @@ function fitSession() {
 
 // --- read view
 const nearBottom = (el) => el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
+let readerHeight = 0, readerFollow = true;
+function compactReadHistory(text) {
+  const out = [], blank = [];
+  const flush = () => { out.push(...(blank.length >= 4 ? ['', ''] : blank)); blank.length = 0; };
+  for (const line of text.replace(/\s+$/, '').split('\n')) {
+    if (line.trim()) { flush(); out.push(line); }
+    else blank.push(line);
+  }
+  flush();
+  return out.join('\n');
+}
 async function pullReader() {
   if (!current || mode !== 'read' || readerBusy) return;
   const name = current, epoch = readerEpoch;
@@ -360,27 +371,50 @@ async function pullReader() {
     return;
   } finally { if (epoch === readerEpoch) readerBusy = false; }
   if (name !== current || mode !== 'read' || epoch !== readerEpoch) return;
-  text = text.replace(/\s+$/, '');
+  text = compactReadHistory(text);
   if (text === lastText) return;
-  const el = $('#reader'), stick = !lastText || nearBottom(el);
+  const el = $('#reader'), stick = lastText === null || readerFollow || nearBottom(el);
   lastText = text;
-  el.textContent = text;
+  el.textContent = text || 'No output yet.';
   if (stick) el.scrollTop = el.scrollHeight;
+  readerFollow = stick;
   $('#to-bottom').hidden = nearBottom(el);
 }
 function startReader() {
-  lastText = '';
+  lastText = null;
+  readerFollow = true;
+  readerHeight = $('#reader').clientHeight;
   $('#reader').textContent = 'Loading…';
   fitSession();
   pullReader();
   readTimer = setInterval(pullReader, 1500);
 }
 function stopReader() { clearInterval(readTimer); readTimer = null; readerEpoch++; readerBusy = false; }
-$('#reader').addEventListener('scroll', () => { $('#to-bottom').hidden = nearBottom($('#reader')); }, { passive: true });
-$('#to-bottom').onclick = () => { const el = $('#reader'); el.scrollTop = el.scrollHeight; $('#to-bottom').hidden = true; };
-// Resizing an iframe can change the visible history without dispatching a scroll event.
+$('#reader').addEventListener('scroll', () => {
+  const el = $('#reader');
+  // A resize may dispatch a native scroll event before ResizeObserver runs.
+  if (el.clientHeight === readerHeight) readerFollow = nearBottom(el);
+  $('#to-bottom').hidden = nearBottom(el);
+}, { passive: true });
+function scrollReaderToBottom() {
+  const el = $('#reader');
+  readerFollow = true;
+  el.scrollTop = el.scrollHeight;
+  $('#to-bottom').hidden = true;
+}
+$('#to-bottom').addEventListener('pointerdown', (e) => {
+  if (document.activeElement !== $('#input')) return;
+  e.preventDefault(); // Keep the iOS keyboard open; WebKit may suppress click after this.
+  scrollReaderToBottom();
+});
+$('#to-bottom').onclick = scrollReaderToBottom;
+// Preserve an at-bottom view when the keyboard changes the iframe height.
 new ResizeObserver(() => {
-  if (current && mode === 'read') $('#to-bottom').hidden = nearBottom($('#reader'));
+  if (!current || mode !== 'read') return;
+  const el = $('#reader'), resized = el.clientHeight !== readerHeight;
+  readerHeight = el.clientHeight;
+  if (resized && readerFollow) el.scrollTop = el.scrollHeight;
+  $('#to-bottom').hidden = nearBottom(el);
 }).observe($('#reader'));
 
 // --- live terminal (reconnects by itself)

@@ -16,7 +16,7 @@ const names = ['codex-example-project-alpha-1234', 'grok-example-project-beta-56
 const output = Array.from({ length: 90 }, (_, i) => `Output line ${i + 1}: readable text should wrap inside the session, with enough room for the message composer.`).join('\n');
 let fixture;
 function reset() {
-  fixture = { offline: false, endError: false, sendError: false, projectError: false, uploadPending: null,
+  fixture = { offline: false, endError: false, sendError: false, projectError: false, history: output, uploadPending: null,
     holdUpload: false, holdSend: false, sendPending: null, transcribePending: null, connections: [], sent: [], sessions: names.map((name, i) => ({ name, lane: i ? 'grok' : 'codex', project: `/example/${i ? 'beta' : 'alpha'}`, created: Date.now(), status: i ? 'needs-you' : 'idle' })) };
 }
 const files = {
@@ -49,7 +49,7 @@ const server = http.createServer(async (req, res) => {
   const match = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(history|keys|end|size|upload)$/);
   if (!match) return reply(404, { error: 'Not found' });
   const [, name, action] = match;
-  if (action === 'history') return reply(200, output, 'text/plain; charset=utf-8');
+  if (action === 'history') return reply(200, fixture.history, 'text/plain; charset=utf-8');
   if (action === 'keys') {
     let body = ''; for await (const chunk of req) body += chunk;
     fixture.sent.push({ name, ...JSON.parse(body) });
@@ -213,6 +213,65 @@ async function run(engineName, engine) {
     fixture.offline = false; await pause(3300);
     assert.doesNotMatch(await frame.locator('#connection-state').innerText(), /offline|lost/i);
     assert.equal(await frame.locator('#keys-toggle').isVisible(), false, 'normal frame keeps the regular key row');
+    const resizeFrame = async (height) => {
+      await page.locator('iframe').evaluate((el, px) => { el.style.height = `${px}px`; }, height);
+      await waitUntil(async () => await frame.locator('#term-view').evaluate(el =>
+        Math.abs(el.getBoundingClientRect().height - innerHeight) < 2), 'resized iframe viewport sync');
+      await pause(100); // Let ResizeObserver and native scroll events settle in either engine.
+    };
+    const tail = async (marker) => frame.locator('#reader').evaluate((el, match) => {
+      const node = el.firstChild, index = node?.textContent.lastIndexOf(match) ?? -1;
+      if (index < 0) return { visible: false };
+      const range = document.createRange();
+      range.setStart(node, index); range.setEnd(node, index + match.length);
+      const line = range.getBoundingClientRect(), reader = el.getBoundingClientRect();
+      return { visible: line.bottom > reader.top && line.top < reader.bottom,
+        gap: reader.bottom - line.bottom, scrollTop: el.scrollTop,
+        maxScroll: el.scrollHeight - el.clientHeight };
+    }, marker);
+    const spacedOutput = output.replaceAll('\n', '\n\n'); // Normal paragraph spacing stays intact.
+    fixture.history = spacedOutput;
+    await waitUntil(async () => await frame.locator('#reader').textContent() === spacedOutput, 'spaced dense history');
+    if (await frame.locator('#to-bottom').isVisible()) await frame.locator('#to-bottom').click();
+    await resizeFrame(296);
+    assert.equal((await tail('Output line 90')).visible, true, 'dense unchanged history follows shrink');
+    await resizeFrame(610);
+    assert.equal((await tail('Output line 90')).visible, true, 'dense unchanged history follows grow');
+    assert.ok((await tail('Output line 90')).maxScroll > 200, 'dense history really overflows');
+    await frame.locator('#reader').evaluate(el => { el.scrollTop = 50; });
+    await pause(100);
+    await resizeFrame(296);
+    assert.equal(Math.round((await tail('Output line 90')).scrollTop), 50, 'shrink preserves deliberate scrollback');
+    await frame.locator('#input').focus();
+    await frame.locator('#to-bottom').tap();
+    assert.equal(await frame.locator('#input').evaluate(el => document.activeElement === el), true,
+      'touching Latest retains composer focus');
+    assert.equal((await tail('Output line 90')).visible, true, 'Latest restores dense tail following');
+    await resizeFrame(610);
+    assert.equal((await tail('Output line 90')).visible, true, 'Latest keeps following on grow');
+
+    fixture.history = 'Earlier response\n' + '\n'.repeat(40) + 'BOTTOM PROMPT>';
+    await waitUntil(async () => await frame.locator('#reader').textContent() ===
+      'Earlier response\n\n\nBOTTOM PROMPT>', 'large blank-row run compacted in Read');
+    await waitUntil(async () => (await tail('BOTTOM PROMPT>')).visible, 'sparse tail before keyboard');
+    await resizeFrame(296);
+    await frame.locator('#input').focus();
+    assert.equal((await tail('BOTTOM PROMPT>')).visible, true, 'sparse unchanged history follows keyboard shrink');
+    assert.equal((await tail('Earlier response')).visible, true, 'earlier content remains visible after compaction');
+    assert.equal(await frame.locator('#to-bottom').isVisible(), false, 'tail following needs no Latest button');
+    await page.screenshot({ path: path.join(artifacts, `${engineName}-sparse-tail.png`) });
+    const sparseTail = await tail('BOTTOM PROMPT>');
+    assert.ok(sparseTail.gap >= 0 && sparseTail.gap <= 50, JSON.stringify(sparseTail));
+
+    fixture.history = '';
+    await frame.locator('#mode-btn').click(); await frame.locator('#mode-btn').click();
+    await waitUntil(async () => await frame.locator('#reader').innerText() === 'No output yet.', 'successful empty capture');
+    assert.equal(await frame.locator('#connection-state').getAttribute('data-state'), 'connected');
+    fixture.history = 'New response\nPrompt>';
+    await frame.locator('#reader').filter({ hasText: 'New response' }).waitFor();
+    fixture.history = output;
+    await frame.locator('#reader').filter({ hasText: 'Output line 90' }).waitFor();
+    await resizeFrame(610);
     fixture.sendError = true;
     const crowdedDraft = Array.from({ length: 9 }, (_, i) => `Draft line ${i + 1} for a short phone frame`).join('\n');
     await frame.locator('#input').fill(crowdedDraft);

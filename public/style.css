@@ -70,7 +70,7 @@ button:active { opacity: .7; }
 /* Session: scrollable transcript (read) or live terminal, with overlays. */
 .stage { position: relative; flex: 1; min-height: 0; display: flex; overflow: hidden; background: var(--term-bg); }
 #term { flex: 1; min-width: 0; padding: 4px; overflow: hidden; }
-#reader { flex: 1; min-width: 0; margin: 0; padding: 10px 12px 48px; overflow-y: auto; overscroll-behavior: contain;
+#reader { flex: 1; min-width: 0; margin: 0; padding: 10px 12px 16px; overflow-y: auto; overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch; color: #d1d5db; font: 12px/1.4 ui-monospace, Menlo, monospace;
   white-space: pre-wrap; word-break: break-word; -webkit-user-select: text; user-select: text; }
 .float { position: absolute; right: 12px; bottom: 12px; border: none; border-radius: 999px; background: var(--accent);
@@ -108,7 +108,7 @@ button:active { opacity: .7; }
 .bar .title #t-name { width: 100%; white-space: normal; overflow-wrap: anywhere; font-size: 13px; line-height: 1.25; }
 button { min-height: 40px; touch-action: manipulation; }
 button:disabled { opacity: .55; }
-#reader { font-size: 14px; line-height: 1.55; padding: 12px 12px 56px; overflow-wrap: anywhere; }
+#reader { font-size: 14px; line-height: 1.55; padding: 12px 12px 16px; overflow-wrap: anywhere; }
 .keys { flex-wrap: wrap; gap: 5px; padding: 5px 8px; }
 .keys button { min-height: 36px; padding: 5px 10px; }
 .keys .extra-key { display: none; }
