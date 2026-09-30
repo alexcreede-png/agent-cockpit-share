@@ -534,6 +534,7 @@ $('#input').oninput = () => { if (current) composer(current).draft = $('#input')
 $('#input').onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey && !touch) { e.preventDefault(); $('#input-row').requestSubmit(); } };
 
 // --- attachments (photo library, camera or Files on iOS)
+const UPLOAD_TIMEOUT_MS = 60000;
 let fileOwner = null;
 $('#attach-btn').onclick = () => { if (current) { fileOwner = current; $('#file').click(); } };
 $('#file').onchange = async () => {
@@ -545,22 +546,28 @@ $('#file').onchange = async () => {
   const c = composer(name);
   for (const f of files) {
     if (state.uploadMaxMB && f.size > state.uploadMaxMB * 1048576) { if (current === name) flash(`${f.name} is over ${state.uploadMaxMB} MB`); continue; }
-    const item = { name: f.name || 'photo', path: null, pct: 0 };
+    const item = { name: f.name || 'photo', path: null, pct: 0, abort: null, removed: false };
     c.pending.push(item); if (current === name) renderPending();
     try {
-      item.path = (await upload(name, f, (pct) => { item.pct = pct; if (current === name) renderPending(); })).path;
+      item.path = (await upload(name, f, (pct) => { item.pct = pct; if (current === name) renderPending(); },
+        (abort) => { item.abort = abort; })).path;
     } catch (err) {
       c.pending = c.pending.filter((x) => x !== item);
-      sessionDelivery(name, 'Upload failed: ' + err.message, true);
-      if (current === name) flash('Upload failed: ' + err.message);
+      if (!item.removed) {
+        sessionDelivery(name, 'Upload failed: ' + err.message + '. Draft kept; attach again if needed.', true);
+        if (current === name) flash('Upload failed: ' + err.message);
+      }
     }
+    item.abort = null;
     if (current === name) renderPending();
   }
 };
-function upload(name, file, onProgress) {
+function upload(name, file, onProgress, onAbortReady) {
   return new Promise((resolve, reject) => {
     const x = new XMLHttpRequest();
     x.open('POST', `/api/sessions/${name}/upload`);
+    x.timeout = UPLOAD_TIMEOUT_MS;
+    onAbortReady(() => x.abort());
     for (const [k, v] of Object.entries(authHeaders())) x.setRequestHeader(k, v);
     x.setRequestHeader('X-Filename', encodeURIComponent(file.name || 'photo.jpg'));
     x.setRequestHeader('Content-Type', 'application/octet-stream');
@@ -570,6 +577,8 @@ function upload(name, file, onProgress) {
       x.status === 200 ? resolve(b) : reject(new Error(b.error || `HTTP ${x.status}`));
     };
     x.onerror = () => reject(new Error('network error'));
+    x.ontimeout = () => reject(new Error('timed out'));
+    x.onabort = () => reject(new Error('canceled'));
     x.send(file);
   });
 }
@@ -584,13 +593,22 @@ function renderPending() {
     label.textContent = it.path ? it.name : `${it.name} · ${it.pct}%`;
     const x = document.createElement('button');
     x.type = 'button'; x.textContent = '×'; x.setAttribute('aria-label', 'Remove ' + it.name);
-    x.onclick = () => { const c = activeComposer(); if (c) { c.pending = c.pending.filter((p) => p !== it); renderPending(); } };
+    x.onclick = () => {
+      const c = activeComposer();
+      if (c) {
+        it.removed = true;
+        c.pending = c.pending.filter((p) => p !== it);
+        it.abort?.();
+        renderPending();
+      }
+    };
     chip.append(label, x);
     return chip;
   }));
 }
 
 // --- dictation: record on the phone, transcribe on the Mac, drop the text in the box to review
+const TRANSCRIBE_TIMEOUT_MS = 60000;
 let rec = null, recStart = 0, recTick = null, requestingMic = false;
 const canRecord = () => !!(window.MediaRecorder && navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
 $('#mic-btn').onclick = async () => {
@@ -614,17 +632,26 @@ $('#mic-btn').onclick = async () => {
     const blob = new Blob(chunks, { type: (r.mimeType || type || 'audio/mp4').split(';')[0] });
     if (!blob.size) { if (current === name) micState('idle'); return; }
     if (current === name) micState('busy');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), TRANSCRIBE_TIMEOUT_MS);
     try {
-      const res = await fetch('/api/transcribe', { method: 'POST', headers: { 'Content-Type': blob.type, ...authHeaders() }, body: blob });
-      const b = await res.json().catch(() => ({}));
+      const res = await fetch('/api/transcribe', { method: 'POST', signal: controller.signal,
+        headers: { 'Content-Type': blob.type, ...authHeaders() }, body: blob });
+      const b = await res.json().catch((err) => { if (controller.signal.aborted) throw err; return {}; });
       if (!res.ok) throw new Error(b.error || `HTTP ${res.status}`);
       if (b.text) {
         const c = composer(name);
         c.draft = (c.draft.trim() ? c.draft.trim() + ' ' : '') + b.text;
         if (current === name) { $('#input').value = c.draft; grow(); }
       } else if (current === name) flash('Didn’t catch anything');
-    } catch (err) { if (current === name) flash('Transcription failed: ' + err.message); }
-    if (current === name) micState('idle');
+    } catch (err) {
+      const message = controller.signal.aborted ? 'Transcription timed out. Try again.' : 'Transcription failed: ' + err.message;
+      sessionDelivery(name, message, true);
+      if (current === name) flash(message);
+    } finally {
+      clearTimeout(timeout);
+      if (current === name) micState('idle');
+    }
   };
   rec = r;
   r.start();

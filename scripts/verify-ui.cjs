@@ -88,6 +88,11 @@ async function run(engineName, engine) {
   try {
     const context = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, colorScheme: 'dark' });
     await context.addInitScript(() => {
+      const send = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.send = function(body) {
+        if (window.__shortUploadTimeout && this.timeout > 0) this.timeout = 150;
+        return send.call(this, body);
+      };
       Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }) } });
       window.MediaRecorder = class { static isTypeSupported() { return true; } constructor() { this.mimeType = 'audio/webm'; this.state = 'inactive'; } start() { this.state = 'recording'; } stop() { this.state = 'inactive'; this.ondataavailable?.({ data: new Blob(['synthetic audio'], { type: 'audio/webm' }) }); this.onstop?.(); } };
     });
@@ -143,6 +148,19 @@ async function run(engineName, engine) {
     assert.equal(await frame.locator('#input').inputValue(), 'Beta draft', 'late dictation stays out of current session');
     await frame.locator('[data-go="list"]:visible').click(); await alpha().click();
     assert.match(await frame.locator('#input').inputValue(), /dictated for alpha/, 'dictation returns to originating draft');
+    // Shorten only a timeout actually configured by the app; retain real XHR/network behavior.
+    fixture.holdUpload = true; fixture.uploadPending = null;
+    await frame.locator('#file').evaluate(() => { window.__shortUploadTimeout = true; });
+    await frame.locator('#file').setInputFiles({ name: 'stalled.txt', mimeType: 'text/plain', buffer: Buffer.from('Synthetic stalled attachment') });
+    await waitUntil(() => fixture.uploadPending, 'stalled upload request');
+    await frame.locator('#delivery.error').filter({hasText: /timed out/i}).waitFor();
+    assert.match(await frame.locator('#input').inputValue(), /dictated for alpha/, 'upload timeout preserves draft');
+    assert.equal(await frame.locator('#attach-row').isVisible(), false, 'failed upload stops blocking composer');
+    fixture.holdUpload = false;
+    await frame.locator('#file').evaluate(() => { window.__shortUploadTimeout = false; });
+    await frame.locator('#send-btn').click();
+    await waitUntil(async () => await frame.locator('#input').inputValue() === '', 'send recovers after upload timeout');
+    assert.match(fixture.sent.at(-1).text, /dictated for alpha/);
     fixture.endError = true; await frame.locator('#kill-btn').click(); await frame.locator('#kill-btn').click();
     await pause(150);
     assert.equal(await frame.locator('#term-view').isVisible(), true, 'failed end retains session view');
@@ -195,7 +213,7 @@ async function run(engineName, engine) {
     fixture.offline = false; await pause(3300);
     assert.doesNotMatch(await frame.locator('#connection-state').innerText(), /offline|lost/i);
     assert.deepEqual(errors, []);
-    console.log(`${engineName}: keyboard/focus, drafts, delayed upload, failed send/end, scroll, live reconnect/session isolation, responsive layouts and new-session flow PASS`);
+    console.log(`${engineName}: keyboard/focus, drafts, delayed upload/timeout recovery, failed send/end, scroll, live reconnect/session isolation, responsive layouts and new-session flow PASS`);
   } finally { await browser.close(); }
 }
 (async () => {

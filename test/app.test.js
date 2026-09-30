@@ -12,7 +12,7 @@ test('public/app.js compiles as a script', () => {
   assert.doesNotThrow(() => new vm.Script(src, { filename: 'app.js' }));
 });
 
-function frontend({ failSend = false, failEnd = false } = {}) {
+function frontend({ failSend = false, failEnd = false, voiceStall = false, voiceBodyStall = false } = {}) {
   class Element {
     constructor() {
       this.children = []; this.dataset = {}; this.style = {}; this.value = ''; this.hidden = false;
@@ -49,6 +49,18 @@ function frontend({ failSend = false, failEnd = false } = {}) {
     setRequestHeader() {}
     send(file) { this.file = file; }
     complete(path) { this.status = 200; this.responseText = JSON.stringify({ path }); this.onload(); }
+    timeoutNow() { this.ontimeout?.(); }
+    abort() { this.aborted = true; this.onabort?.(); }
+  }
+  class FakeMediaRecorder {
+    static isTypeSupported() { return true; }
+    constructor() { this.mimeType = 'audio/webm'; this.state = 'inactive'; }
+    start() { this.state = 'recording'; }
+    stop() {
+      this.state = 'inactive';
+      this.ondataavailable?.({ data: new Blob(['synthetic audio'], { type: 'audio/webm' }) });
+      this.onstop?.();
+    }
   }
   class FakeTerminal {
     constructor() { this.cols = 80; this.rows = 24; this.writes = []; terminals.push(this); }
@@ -63,10 +75,11 @@ function frontend({ failSend = false, failEnd = false } = {}) {
     send(data) { this.sent.push(JSON.parse(data)); }
     close() { this.readyState = 3; }
   }
-  const window = { addEventListener() {}, MediaRecorder: null, visualViewport: null };
+  const window = { addEventListener() {}, MediaRecorder: voiceStall || voiceBodyStall ? FakeMediaRecorder : null, visualViewport: null };
   window.parent = window;
   const context = vm.createContext({
-    document, window, navigator: {}, matchMedia: () => ({ matches: true }), XMLHttpRequest: XHR,
+    document, window, navigator: voiceStall || voiceBodyStall ? { mediaDevices: { getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }) } } : {},
+    matchMedia: () => ({ matches: true }), XMLHttpRequest: XHR, MediaRecorder: FakeMediaRecorder, Blob,
     Terminal: FakeTerminal, WebSocket: FakeSocket, FitAddon: { FitAddon: class { fit() {} } },
     AbortController,
     location: { hash: '', protocol: 'https:', host: 'example.test' }, history: { replaceState() {} },
@@ -76,6 +89,15 @@ function frontend({ failSend = false, failEnd = false } = {}) {
     setInterval: () => 1, clearInterval() {},
     addEventListener() {}, innerHeight: 800, fetch: async (path, opts = {}) => {
       calls.push({ path, opts });
+      if (voiceStall && path === '/api/transcribe') return new Promise((resolve, reject) => {
+        opts.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+      });
+      if (voiceBodyStall && path === '/api/transcribe') return {
+        ok: true,
+        json: () => new Promise((resolve, reject) => {
+          opts.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+        }),
+      };
       if (path === '/api/sessions/a/keys') await new Promise((resolve) => { finishSend = resolve; });
       const body = path === '/api/state' ? { lanes: [], sessions: [], transcribe: false } : {};
       const failed = (failSend && path === '/api/sessions/a/keys') || (failEnd && path === '/api/sessions/a/end');
@@ -121,6 +143,85 @@ test('upload completion remains attached to the original session', async () => {
   vm.runInContext("openTerm('a')", h.context);
   assert.equal(h.el('#attach-row').hidden, false);
   assert.equal(h.el('#attach-row').children.length, 1);
+});
+
+test('stalled upload times out, keeps the draft and frees Send in its own session', async () => {
+  const h = frontend();
+  await tick();
+  vm.runInContext("openTerm('a')", h.context);
+  h.el('#input').value = 'Draft survives'; h.el('#input').oninput();
+  h.el('#file').files = [{ name: 'stalled.txt', size: 4 }];
+  const upload = h.el('#file').onchange();
+  await tick();
+  assert.equal(h.uploads[0].timeout, 60000);
+  vm.runInContext("openTerm('b')", h.context);
+  h.el('#input').value = 'B draft'; h.el('#input').oninput();
+  h.uploads[0].timeoutNow(); await upload;
+  assert.equal(h.el('#input').value, 'B draft');
+  assert.equal(h.el('#attach-row').hidden, true);
+  vm.runInContext("openTerm('a')", h.context);
+  assert.equal(h.el('#input').value, 'Draft survives');
+  assert.equal(h.el('#attach-row').hidden, true);
+  assert.match(h.el('#delivery').textContent, /Upload failed: timed out/);
+  const send = h.el('#input-row').onsubmit({ preventDefault() {} });
+  await tick();
+  assert.equal(h.calls.filter((c) => c.path === '/api/sessions/a/keys').length, 1);
+  h.finishSend(); await send;
+  assert.equal(h.el('#input').value, '');
+});
+
+test('canceled upload aborts quietly and a new attachment can be sent', async () => {
+  const h = frontend();
+  await tick();
+  vm.runInContext("openTerm('a')", h.context);
+  h.el('#input').value = 'With file'; h.el('#input').oninput();
+  h.el('#file').files = [{ name: 'old.txt', size: 4 }];
+  const first = h.el('#file').onchange();
+  await tick();
+  h.el('#attach-row').children[0].children[1].click();
+  await first;
+  assert.equal(h.uploads[0].aborted, true);
+  assert.equal(h.el('#attach-row').hidden, true);
+  assert.equal(h.el('#delivery').hidden, true);
+  h.el('#file').files = [{ name: 'new.txt', size: 4 }];
+  const retry = h.el('#file').onchange();
+  await tick();
+  h.uploads[1].complete('/tmp/a/new.txt'); await retry;
+  const send = h.el('#input-row').onsubmit({ preventDefault() {} });
+  await tick();
+  const request = h.calls.find((c) => c.path === '/api/sessions/a/keys');
+  assert.match(JSON.parse(request.opts.body).text, /With file\n\/tmp\/a\/new.txt/);
+  h.finishSend(); await send;
+  assert.equal(h.el('#attach-row').hidden, true);
+});
+
+test('stalled transcription times out without changing the session draft', async () => {
+  const h = frontend({ voiceStall: true });
+  await tick();
+  vm.runInContext("openTerm('a')", h.context);
+  h.el('#input').value = 'Typed first'; h.el('#input').oninput();
+  await h.el('#mic-btn').click();
+  h.el('#mic-btn').click();
+  const timer = h.timers.find((t) => t.ms === 60000 && !t.canceled);
+  assert.ok(timer);
+  timer.fn(); await tick();
+  assert.equal(h.el('#input').value, 'Typed first');
+  assert.equal(h.el('#mic-btn').disabled, false);
+  assert.match(h.el('#delivery').textContent, /Transcription timed out/);
+});
+
+test('transcription timeout also covers a stalled response body', async () => {
+  const h = frontend({ voiceBodyStall: true });
+  await tick();
+  vm.runInContext("openTerm('a')", h.context);
+  await h.el('#mic-btn').click();
+  h.el('#mic-btn').click();
+  await tick(); // Let fetch headers resolve so JSON body consumption has begun.
+  const timer = h.timers.find((t) => t.ms === 60000 && !t.canceled);
+  assert.ok(timer);
+  timer.fn(); await tick();
+  assert.equal(h.el('#mic-btn').disabled, false);
+  assert.match(h.el('#delivery').textContent, /Transcription timed out/);
 });
 
 test('failed send retains the draft and failed end keeps the session open', async () => {
