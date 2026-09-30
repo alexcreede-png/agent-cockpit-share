@@ -137,6 +137,24 @@ Then open `http://127.0.0.1:8826` (TCP mode, for testing only).
 npm test
 ```
 
+For an isolated end-to-end runtime check (synthetic project and its own tmux server):
+
+```bash
+node scripts/verify-runtime.cjs
+```
+
+For browser acceptance, use an existing Playwright installation available through Node's
+module resolution, then run `node scripts/verify-ui.cjs`. It exercises synthetic API fixtures
+in WebKit and Chromium, including session-scoped drafts/uploads, failed sends and session ending,
+keyboard navigation, scrollback and responsive layouts. Optional `COCKPIT_WEBKIT_EXECUTABLE` and
+`COCKPIT_CHROMIUM_EXECUTABLE` variables select already-installed browser binaries. Screenshots go
+to a temporary directory, or `COCKPIT_ARTIFACT_DIR`. Neither check reads existing conversations.
+
+To check the containing dashboard, set `COCKPIT_DASHBOARD_DIST` to its built `dist/public`
+directory and run `node scripts/verify-host.cjs` with the same Playwright/browser setup.
+All API and external requests are synthetic fixtures. The check covers a reduced visual viewport,
+viewport panning, an active usage warning, desktop width, and leaving the cockpit route.
+
 ## Known limits
 
 - "Needs you" is a heuristic over the last lines of the screen (`lib/status.js`); new CLI dialogs

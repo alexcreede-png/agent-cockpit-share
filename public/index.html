@@ -22,9 +22,11 @@
     <span id="summary" class="muted"></span>
     <button id="new-btn" class="primary">+ New</button>
   </header>
+  <div class="list-tools"><label for="session-search">Sessions</label><input id="session-search" type="search" placeholder="Find a session" autocomplete="off"></div>
   <ul id="sessions"></ul>
+  <p id="list-state" class="muted center" role="status">Loading sessions…</p>
   <p id="empty" class="muted center" hidden>No sessions yet. Tap <b>+ New</b> to start one.</p>
-  <p id="conn" class="warn center" hidden>Can't reach the Mac.</p>
+  <p id="conn" class="warn center" role="alert" hidden>Can’t reach the Mac. Reconnecting…</p>
 </section>
 
 <!-- Pair this phone (shown when the server says "unpaired") -->
@@ -45,11 +47,12 @@
     <h1>New session</h1>
   </header>
   <div class="form">
-    <label>Lane</label>
-    <div id="lanes" class="chips"></div>
+    <label id="lane-label">Lane</label>
+    <div id="lanes" class="chips" role="group" aria-labelledby="lane-label"></div>
     <label for="project-filter">Project</label>
     <input id="project-filter" placeholder="Filter projects…" autocomplete="off" autocapitalize="off">
     <ul id="projects" class="pick"></ul>
+    <p id="project-state" class="muted" role="status"></p>
     <label for="prompt">First message (optional)</label>
     <textarea id="prompt" rows="3" placeholder="What should it do? Dictation works here."></textarea>
     <button id="start-btn" class="primary wide" disabled>Start</button>
@@ -60,13 +63,16 @@
 <!-- Session -->
 <section id="term-view" class="view" hidden>
   <header class="bar">
-    <button class="back" data-go="list">‹</button>
-    <div class="title"><span id="t-name"></span><span id="t-status" class="pill"></span></div>
-    <button id="mode-btn">Live</button>
+    <button class="back" data-go="list" aria-label="Back to sessions">‹</button>
+    <div class="title">
+      <span id="t-name"></span>
+      <div class="title-meta"><span id="t-context"></span><span id="t-status" class="pill"></span><span id="connection-state" class="connection" role="status" aria-live="polite"></span></div>
+    </div>
+    <button id="mode-btn" aria-label="Switch to live terminal">Live</button>
     <button id="kill-btn" class="danger">End</button>
   </header>
   <div class="stage">
-    <pre id="reader" tabindex="0"></pre>
+    <pre id="reader" tabindex="0" aria-label="Session output"></pre>
     <div id="term" hidden></div>
     <button id="to-bottom" class="float" hidden>↓ Latest</button>
     <div id="conn-note" class="note" hidden></div>
@@ -77,13 +83,14 @@
     <button type="button" id="attach-btn" class="icon" aria-label="Attach photo or file">
       <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.5l-8.6 8.6a5.5 5.5 0 0 1-7.8-7.8l9.2-9.2a3.7 3.7 0 0 1 5.2 5.2l-9.2 9.2a1.8 1.8 0 0 1-2.6-2.6l8.5-8.5"/></svg>
     </button>
-    <textarea id="input" rows="1" placeholder="Message"></textarea>
+    <textarea id="input" rows="1" aria-label="Message" placeholder="Message"></textarea>
     <button type="button" id="mic-btn" class="icon mic" aria-label="Dictate" hidden>
       <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
       <span id="mic-label"></span>
     </button>
-    <button class="primary" type="submit">Send</button>
+    <button id="send-btn" class="primary" type="submit">Send</button>
   </form>
+  <p id="delivery" class="delivery" role="status" aria-live="polite" hidden></p>
   <input type="file" id="file" multiple hidden>
 </section>
 

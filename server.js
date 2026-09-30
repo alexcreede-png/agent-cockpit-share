@@ -176,6 +176,7 @@ async function handle(req, res) {
 }
 
 const devices = config.pairing ? pairing.store(config.stateDir) : null;
+let lastHeaderLog = 0;
 const paired = (req) => !devices || devices.check(pairing.readToken(req));
 
 // Trade a one-time code (from `npm run pair` on the Mac) for a device cookie.
@@ -193,11 +194,18 @@ const server = http.createServer((req, res) => {
   const refused = guard.checkRequest(req, CFG);
   if (refused) { log('refused', refused, req.method, req.url.split('?')[0]); return send(res, 403, { error: 'forbidden' }); }
   const p = req.url.split('?')[0];
+  // Sites allowed to frame us (already public in our CSP); the page needs them before pairing
+  // to know which parent it may hand its device token to.
+  if (req.method === 'GET' && p === '/api/embed-origins') return send(res, 200, config.frameAncestors);
   if (devices && req.method === 'POST' && p === '/api/pair') {
     return pair(req, res).catch((e) => { log('error', e.message); if (!res.headersSent) send(res, 400, { error: e.message }); });
   }
   // The page and its scripts are public code; everything else needs a paired device.
   if (!(req.method === 'GET' && STATIC[p]) && !paired(req)) { log('unpaired', req.method, p); return send(res, 401, { error: 'unpaired' }); }
+  // Evidence for the framed (header-token) path, at most once per ten minutes.
+  if (devices && p === '/api/state' && req.headers['x-cockpit-device'] && Date.now() - lastHeaderLog > 600000) {
+    lastHeaderLog = Date.now(); log('paired via header token');
+  }
   handle(req, res).catch((e) => { log('error', e.message); if (!res.headersSent) send(res, e.status || 500, { error: e.message }); });
 });
 

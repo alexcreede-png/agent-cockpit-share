@@ -54,3 +54,15 @@ test('working spinner footer is not mistaken for a prompt', () => {
 });
 
 test('first sighting reads idle immediately', () => assert.equal(classify(null, 'static', 0, false).status, 'idle'));
+
+// Text captured from a disposable Codex folder-access screen; path omitted.
+test('real Codex folder access screen asks for attention', () => {
+  const screen = `Folder access
+Trust this folder? Codex can read, edit, and run files here, subject to your permission settings.
+Folder settings can run code automatically, even without a model request.
+› 1. Trust and continue
+  2. Quit
+  enter continue · esc quit`;
+  const result = classify(null, screen, 0, false);
+  assert.equal(result.status, 'needs-you');
+});

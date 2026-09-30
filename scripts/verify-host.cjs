@@ -1,0 +1,31 @@
+'use strict';
+// Render an already-built dashboard with only synthetic API and cockpit fixtures.
+// All nonlocal requests are intercepted; no live account, session or market data is read.
+const fs=require('fs'),path=require('path'),http=require('http'),assert=require('assert/strict');
+const {webkit,chromium}=require('playwright');
+const dashboardDist=process.env.COCKPIT_DASHBOARD_DIST;
+assert.ok(dashboardDist, 'Set COCKPIT_DASHBOARD_DIST to the built dashboard dist/public directory');
+const cockpit=process.env.COCKPIT_SOURCE_ROOT || path.resolve(__dirname,'..');
+const artifacts=process.env.COCKPIT_ARTIFACT_DIR || fs.mkdtempSync(path.join(require('os').tmpdir(),'cockpit-host-'));fs.mkdirSync(artifacts,{recursive:true});
+const mimes={'.js':'text/javascript','.css':'text/css','.html':'text/html; charset=utf-8','.svg':'image/svg+xml','.json':'application/json'};
+const server=http.createServer((req,res)=>{const u=new URL(req.url,'http://local');const rel=u.pathname==='/'?'index.html':u.pathname.slice(1);const file=path.join(dashboardDist,rel);if(!file.startsWith(dashboardDist)||!fs.existsSync(file)){res.writeHead(404);res.end();return;}res.writeHead(200,{'Content-Type':mimes[path.extname(file)]||'application/octet-stream'});res.end(fs.readFileSync(file));});
+(async()=>{await new Promise(r=>server.listen(0,'127.0.0.1',r));const origin=`http://127.0.0.1:${server.address().port}`;
+try{for(const [engineName,engine,executablePath] of [['webkit',webkit,process.env.COCKPIT_WEBKIT_EXECUTABLE],['chromium',chromium,process.env.COCKPIT_CHROMIUM_EXECUTABLE]]){
+const browser=await engine.launch({headless:true,executablePath});try{const context=await browser.newContext({viewport:{width:390,height:844},isMobile:true,hasTouch:true,colorScheme:'dark'});let health='current';
+await context.addInitScript(()=>{try{localStorage.setItem('cockpit-mode','read')}catch{}if(window===window.top){const vv=new EventTarget();vv.height=innerHeight;vv.offsetTop=0;vv.width=innerWidth;vv.scale=1;Object.defineProperty(window,'visualViewport',{configurable:true,value:vv});window.__testViewport=vv;}});
+await context.route('**/*',async route=>{const req=route.request(),u=new URL(req.url());
+const json=value=>route.fulfill({json:value});
+if(u.origin===origin){if(u.pathname==='/api/auth/session')return json({authenticated:true,required:true});if(u.pathname==='/api/meta/usage/health')return json({state:health,lastIngestAt:null,lastFailureAt:null,checkedAt:new Date().toISOString()});if(u.pathname.startsWith('/api/'))return json({});return route.continue();}
+// Every nonlocal request is fulfilled here, including the cockpit iframe. No live data.
+const files={'/':'public/index.html','/app.js':'public/app.js','/style.css':'public/style.css','/icon.svg':'public/icon.svg','/manifest.webmanifest':'public/manifest.webmanifest','/vendor/xterm.js':'node_modules/@xterm/xterm/lib/xterm.js','/vendor/xterm.css':'node_modules/@xterm/xterm/css/xterm.css','/vendor/addon-fit.js':'node_modules/@xterm/addon-fit/lib/addon-fit.js'};
+if(u.pathname==='/api/embed-origins')return json([origin]);
+if(u.pathname==='/api/state')return json({lanes:['codex'],sessions:[{name:'codex-example-demo',project:'/example/demo',lane:'codex',created:Date.now(),status:'idle'}]});
+if(u.pathname.endsWith('/history'))return route.fulfill({contentType:'text/plain',body:Array.from({length:70},(_,i)=>`Example response line ${i+1} wraps naturally in the reading pane.`).join('\n')});
+if(u.pathname.endsWith('/size'))return json({});
+if(files[u.pathname])return route.fulfill({body:fs.readFileSync(path.join(cockpit,files[u.pathname])),contentType:mimes[path.extname(files[u.pathname])]||'text/plain'});
+return route.fulfill({status:404,body:'Synthetic preview: external request blocked'});
+});
+const page=await context.newPage();const errors=[];page.on('pageerror',e=>errors.push(e.message));await page.goto(origin+'/#/cockpit');const iframe=page.locator('[data-testid="iframe-cockpit"]');await iframe.waitFor();const frame=page.frameLocator('[data-testid="iframe-cockpit"]');await frame.locator('#sessions button').first().click();await frame.locator('#reader').waitFor();
+for(const scenario of [{h:844,top:0,health:'current'},{h:480,top:0,health:'failed'},{h:480,top:55,health:'failed'}]){health=scenario.health;await page.evaluate(({h,top})=>{window.__testViewport.height=h;window.__testViewport.offsetTop=top;window.__testViewport.dispatchEvent(new Event('resize'));},scenario);if(health==='failed')await page.reload();await iframe.waitFor();if(await frame.locator('#list-view').isVisible())await frame.locator('#sessions button').first().click();await page.evaluate(({h,top})=>{window.__testViewport.height=h;window.__testViewport.offsetTop=top;window.__testViewport.dispatchEvent(new Event('resize'));},scenario);await page.waitForTimeout(300);const box=await iframe.boundingBox();const child=await frame.locator('#reader').evaluate(el=>({reader:el.clientHeight,inputBottom:document.querySelector('#input-row').getBoundingClientRect().bottom,height:innerHeight}));assert.ok(box.y+box.height<=scenario.h+scenario.top+1,JSON.stringify({scenario,box,child}));assert.ok(child.inputBottom<=child.height+1);assert.ok(child.reader>=50,JSON.stringify({scenario,box,child}));await page.screenshot({path:path.join(artifacts,`host-${engineName}-${scenario.h}-${scenario.top}.png`)});console.log(engineName,scenario,box,child);}
+await page.setViewportSize({width:1280,height:900});await page.evaluate(()=>{window.__testViewport.height=900;window.__testViewport.offsetTop=0;window.__testViewport.dispatchEvent(new Event('resize'));});await page.waitForTimeout(250);assert.equal(await page.evaluate(()=>document.body.scrollWidth>innerWidth),false);await page.screenshot({path:path.join(artifacts,`host-${engineName}-desktop.png`)});await page.setViewportSize({width:390,height:844});await page.evaluate(()=>location.hash='/lifecycle');await page.waitForTimeout(350);assert.equal(await page.locator('main').evaluate(el=>getComputedStyle(el.parentElement).position==='fixed'),false,'other route retains document layout');assert.deepEqual(errors,[]);
+}finally{await browser.close();}}}finally{await new Promise(r=>server.close(r));}})().catch(e=>{console.error(e);process.exitCode=1});
