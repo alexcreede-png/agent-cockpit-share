@@ -165,3 +165,11 @@ viewport panning, an active usage warning, desktop width, and leaving the cockpi
   may need a pattern added.
 - Only sessions started from the cockpit are visible.
 - `node-pty` is a native module: after a Node upgrade run `npm rebuild node-pty && npm run postinstall`.
+
+For real browser-to-terminal delivery acceptance with installed Playwright browsers:
+
+```bash
+node scripts/verify-delivery.cjs
+```
+
+This uses a synthetic terminal fixture on a unique tmux server. It verifies actual single-line and multiline submissions, rendered replies, resize/focus behavior, and cleanup without accessing existing sessions. Use the same optional browser executable overrides as the UI suite.

@@ -153,7 +153,7 @@ async function refresh() {
     projectsRoot = state.projectsRoot || '';
     $('#conn').hidden = true;
     renderList();
-    if (current && (mode !== 'live' || (ws && ws.readyState === 1))) connection('connected');
+    if (current && mode === 'live' && ws && ws.readyState === 1) connection('connected');
     if (current) {
       const s = state.sessions.find((x) => x.name === current);
       if (s) renderTermIdentity(s);
@@ -390,8 +390,13 @@ async function pullReader() {
   if (name !== current || mode !== 'read' || epoch !== readerEpoch) return;
   text = compactReadHistory(text);
   readerState(text ? 'Output available.' : 'No output yet.');
-  if (text === lastText) return;
-  const el = $('#reader'), stick = lastText === null || readerFollow || nearBottom(el);
+  const el = $('#reader'), resized = el.clientHeight !== readerHeight;
+  readerHeight = el.clientHeight;
+  if (text === lastText) {
+    if (resized && readerFollow) el.scrollTop = el.scrollHeight;
+    return;
+  }
+  const stick = lastText === null || readerFollow || nearBottom(el);
   lastText = text;
   el.textContent = text || 'No output yet.';
   if (stick) el.scrollTop = el.scrollHeight;
@@ -399,6 +404,7 @@ async function pullReader() {
   $('#to-bottom').hidden = nearBottom(el);
 }
 function startReader() {
+  connection('reconnecting');
   lastText = null;
   readerFollow = true;
   readerHeight = $('#reader').clientHeight;

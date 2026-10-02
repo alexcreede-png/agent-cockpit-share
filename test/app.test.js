@@ -440,3 +440,46 @@ test('explicit server length rejection reports not sent and retains the draft', 
   assert.match(h.el('#delivery').textContent, /Message not sent.*draft is kept/);
   assert.doesNotMatch(h.el('#delivery').textContent, /unconfirmed/);
 });
+
+
+test('state success cannot mask failed Read capture or retain Live connection during mode change', async () => {
+  const h = frontend({historyError:true});
+  await tick();
+  vm.runInContext("openTerm('a')",h.context);
+  await tick();
+  assert.equal(h.el('#connection-state').dataset.state,'offline');
+  await vm.runInContext('refresh()',h.context);
+  assert.equal(h.el('#connection-state').dataset.state,'offline');
+  assert.equal(h.el('#t-status').textContent,'gone', 'missing session is explicitly gone');
+  assert.match(h.el('#reader').textContent,/unavailable/);
+  vm.runInContext("setMode('live')",h.context);
+  const socket=h.sockets.at(-1); socket.readyState=1; socket.onopen();
+  assert.equal(h.el('#connection-state').dataset.state,'connected');
+  vm.runInContext("setMode('read')",h.context);
+  assert.equal(h.el('#connection-state').dataset.state,'reconnecting');
+  await tick();
+  assert.equal(h.el('#connection-state').dataset.state,'offline');
+  h.setHistoryError(false);
+  h.setHistory('Recovered');
+  await vm.runInContext('pullReader()',h.context);
+  assert.equal(h.el('#connection-state').dataset.state,'connected');
+});
+
+
+test('captured Read geometry accepts immediate scrollback and unchanged polling keeps resize tail following', async () => {
+  const h=frontend({history:'Dense output'});
+  await tick();
+  const reader=h.el('#reader');reader.clientHeight=426;reader.scrollHeight=1000;
+  vm.runInContext("openTerm('a')",h.context);await tick();
+  reader.clientHeight=437;h.setHistory('Updated dense output');
+  await vm.runInContext('pullReader()',h.context);
+  reader.scrollTop=50;reader.fire('scroll');
+  h.observers.find(o=>o.element===reader).fn();
+  assert.equal(reader.scrollTop,50,'capture/status height change cannot erase immediate scrollback');
+  h.el('#to-bottom').click();
+  reader.clientHeight=180;reader.scrollTop=600;
+  await vm.runInContext('pullReader()',h.context);
+  assert.equal(reader.scrollTop,1000,'same text polling follows shrink before pending observer');
+  h.observers.find(o=>o.element===reader).fn();
+  assert.equal(reader.scrollTop,1000);
+});

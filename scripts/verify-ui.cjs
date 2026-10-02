@@ -282,6 +282,8 @@ async function run(engineName, engine) {
     await frame.locator('#mode-btn').click(); await frame.locator('#mode-btn').click();
     await frame.locator('#reader').filter({hasText:'Output unavailable. Retrying…'}).waitFor();
     assert.match(await frame.locator('#reader-state').textContent(), /Retrying automatically/);
+    await frame.locator('#reader').evaluate(() => refresh()); // Successful state query must not mask capture failure.
+    assert.equal(await frame.locator('#connection-state').getAttribute('data-state'), 'offline');
     fixture.historyError = false;
     await waitUntil(async () => await frame.locator('#reader').innerText() === 'No output yet.', 'successful empty capture');
     assert.equal(await frame.locator('#connection-state').getAttribute('data-state'), 'connected');
