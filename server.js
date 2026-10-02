@@ -123,7 +123,8 @@ async function handle(req, res) {
     if (!tmux.LANES[body.lane]) return send(res, 400, { error: 'unknown lane' });
     const project = guard.resolveProject(body.project, config);
     if (!project) return send(res, 403, { error: 'project not allowed' });
-    const prompt = typeof body.prompt === 'string' ? body.prompt.slice(0, 8000) : '';
+    const prompt = typeof body.prompt === 'string' ? body.prompt : '';
+    if (prompt.length > 8000) return send(res, 413, { error: 'First message is too long (maximum 8,000 characters). Shorten it and try again.' });
     const name = await tmux.create({ lane: body.lane, project, prompt });
     log('created', name, body.lane);
     return send(res, 200, { name });
@@ -150,7 +151,10 @@ async function handle(req, res) {
         if (!tmux.KEYS.has(body.key) && !/^[0-9yn]$/.test(body.key)) return send(res, 400, { error: 'key not allowed' });
         await tmux.sendKey(s.name, body.key);
       }
-      else if (typeof body.text === 'string') await tmux.sendText(s.name, body.text.slice(0, 20000));
+      else if (typeof body.text === 'string') {
+        if (body.text.length > 20000) return send(res, 413, { error: 'Message is too long (maximum 20,000 characters). Shorten it and try again.' });
+        await tmux.sendText(s.name, body.text);
+      }
       else return send(res, 400, { error: 'text or key required' });
       return send(res, 200, { ok: true });
     }

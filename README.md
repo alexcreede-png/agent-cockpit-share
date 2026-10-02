@@ -17,6 +17,10 @@ request. Read **Security** below before you run it.
 | + New | Pick a lane (claude, codex, grok, agy, shell), a project, optional first message |
 | Session | **Read** view (default on phones): the whole scrollback, swipeable, refreshed live, with a "↓ Latest" button. **Live** view: the real terminal, reconnects by itself. Quick keys (Esc, Enter, arrows, Tab, Shift-Tab, Ctrl-C, 1/2/3, y/n). Message box (multi-line is sent as one message). 📎 attach photos, camera shots or files; 🎤 dictate (transcribed on the Mac, lands in the box for review). End (two taps) |
 
+“Sent to terminal” confirms delivery to the CLI; its response appears in the output pane. If delivery is unconfirmed, check the output before retrying to avoid sending twice. First messages support up to 8,000 characters, and session messages up to 20,000 (including attached file paths). Longer messages are rejected rather than shortened, and the draft stays available to edit.
+
+Read view shortens runs of four or more blank terminal rows to two for readability. Live view preserves the terminal display.
+
 ## Requirements
 
 - macOS (Linux likely works; untested), Node 22+, tmux 3.2+.

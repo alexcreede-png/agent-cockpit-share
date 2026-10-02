@@ -17,7 +17,16 @@ const wait=ms=>new Promise(r=>setTimeout(r,ms));
 async function post(p,b){const r=await fetch(base+p,{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:JSON.stringify(b)});assert.equal(r.status,200,await r.clone().text());return r.json();}
 (async()=>{let name;try{
  for(let i=0;i<40&&!logs.includes('cockpit on');i++)await wait(100);assert.match(logs,/cockpit on/);
- ({name}=await post('/api/sessions',{lane:'shell',project:path.join(tmp,'projects','example')}));await wait(800);
+ const rejectedStart=await fetch(base+'/api/sessions',{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:JSON.stringify({lane:'shell',project:path.join(tmp,'projects','example'),prompt:'x'.repeat(8001)})});
+ assert.equal(rejectedStart.status,413);assert.match((await rejectedStart.json()).error,/too long/);
+ assert.equal((await(await fetch(base+'/api/state')).json()).sessions.length,0,'oversize initial prompt must not create a session');
+ ({name}=await post('/api/sessions',{lane:'shell',project:path.join(tmp,'projects','example'),prompt:'x'.repeat(8000)}));await wait(800);
+ const rejectedText=await fetch(`${base}/api/sessions/${name}/keys`,{method:'POST',headers:{Origin:base,'Content-Type':'application/json'},body:JSON.stringify({text:'x'.repeat(20001)})});
+ assert.equal(rejectedText.status,413);assert.match((await rejectedText.json()).error,/too long/);
+ const afterRejected=await(await fetch(`${base}/api/sessions/${name}/history`)).text();assert.ok(!afterRejected.includes('x'.repeat(100)),'oversize message must not reach terminal');
+ const boundaryTail="\nprintf 'BOUNDARY_%s\\n' 'REPLY'";
+ await post(`/api/sessions/${name}/keys`,{text:'#'+'x'.repeat(20000-boundaryTail.length-1)+boundaryTail});await wait(200);
+ assert.match(await(await fetch(`${base}/api/sessions/${name}/history`)).text(),/BOUNDARY_REPLY/,'message at the limit reaches its final line');
  await post(`/api/sessions/${name}/keys`,{text:"printf 'SMOKE_%s\\n' 'REPLY'"});await wait(200);
  const screen=await(await fetch(`${base}/api/sessions/${name}/history`)).text();assert.match(screen,/SMOKE_REPLY/);
  await post(`/api/sessions/${name}/keys`,{key:'C-c'});

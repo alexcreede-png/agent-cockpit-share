@@ -56,7 +56,7 @@
     <label for="prompt">First message (optional)</label>
     <textarea id="prompt" rows="3" placeholder="What should it do? Dictation works here."></textarea>
     <button id="start-btn" class="primary wide" disabled>Start</button>
-    <p id="new-err" class="warn"></p>
+    <p id="new-err" class="warn" role="alert"></p>
   </div>
 </section>
 
@@ -72,6 +72,7 @@
     <button id="kill-btn" class="danger">End</button>
   </header>
   <div class="stage">
+    <p id="reader-state" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
     <pre id="reader" tabindex="0" aria-label="Session output"></pre>
     <div id="term" hidden></div>
     <button id="to-bottom" class="float" hidden>↓ Latest</button>

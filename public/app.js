@@ -3,6 +3,7 @@ const $ = (s) => document.querySelector(s);
 const STATUS_LABEL = { working: 'working', 'needs-you': 'needs you', idle: 'idle', exited: 'exited' };
 const QUICK_KEYS = [['Esc', 'Escape'], ['⏎', 'Enter'], ['↑', 'Up'], ['↓', 'Down'], ['Tab', 'Tab'],
   ['⇧Tab', 'BTab'], ['^C', 'C-c'], ['1', '1'], ['2', '2'], ['3', '3'], ['y', 'y'], ['n', 'n'], ['⌫', 'BSpace']];
+const MESSAGE_MAX_CHARS = 20000, PROMPT_MAX_CHARS = 8000;
 const touch = matchMedia('(pointer: coarse)').matches;
 
 let state = { lanes: [], sessions: [] };
@@ -54,7 +55,9 @@ async function api(path, opts = {}) {
       // Only a token the server refused (e.g. revoked) is reported; merely having none yet is not,
       // or the parent would drop the copy it is about to hand back.
       if (err === 'unpaired' && sent) { device.set(''); tellParent({ type: 'cockpit-unpaired' }); }
-      throw new Error(err);
+      const error = new Error(err);
+      error.status = res.status;
+      throw error;
     }
     return (res.headers.get('content-type') || '').includes('json') ? await res.json() : await res.text();
   } finally {
@@ -134,7 +137,8 @@ $('#session-search').oninput = renderList;
 
 function connection(value) {
   const el = $('#connection-state');
-  el.textContent = value === 'connected' ? 'Connected' : value === 'reconnecting' ? 'Reconnecting…' : 'Offline';
+  const text = value === 'connected' ? 'Connected' : value === 'reconnecting' ? 'Reconnecting…' : 'Offline';
+  if (el.textContent !== text) el.textContent = text;
   el.setAttribute('aria-label', el.textContent);
   el.dataset.state = value;
 }
@@ -247,6 +251,10 @@ $('#project-filter').oninput = () => { pick.project = null; renderProjects(); re
 const ready = () => $('#start-btn').disabled = starting || projectsLoading || !(pick.lane && pick.project);
 $('#start-btn').onclick = async () => {
   if (starting || $('#start-btn').disabled) return;
+  if ($('#prompt').value.length > PROMPT_MAX_CHARS) {
+    $('#new-err').textContent = 'First message is too long. Use 8,000 characters or fewer; your draft is kept.';
+    return;
+  }
   starting = true;
   $('#start-btn').disabled = true; $('#start-btn').textContent = 'Starting…';
   $('#new-err').textContent = '';
@@ -358,6 +366,11 @@ function compactReadHistory(text) {
   flush();
   return out.join('\n');
 }
+function readerState(text, busy = false) {
+  const status = $('#reader-state');
+  if (status.textContent !== text) status.textContent = text;
+  $('#reader').setAttribute('aria-busy', String(busy));
+}
 async function pullReader() {
   if (!current || mode !== 'read' || readerBusy) return;
   const name = current, epoch = readerEpoch;
@@ -367,11 +380,16 @@ async function pullReader() {
     text = await api(`/api/sessions/${name}/history?lines=3000`);
     if (name === current && epoch === readerEpoch) { note(''); connection('connected'); }
   } catch {
-    if (name === current && epoch === readerEpoch) { note('Connection lost — retrying…'); connection('offline'); }
+    if (name === current && epoch === readerEpoch) {
+      note('Connection lost — retrying…'); connection('offline');
+      readerState('Output unavailable. Retrying automatically.');
+      if (lastText === null) $('#reader').textContent = 'Output unavailable. Retrying…';
+    }
     return;
   } finally { if (epoch === readerEpoch) readerBusy = false; }
   if (name !== current || mode !== 'read' || epoch !== readerEpoch) return;
   text = compactReadHistory(text);
+  readerState(text ? 'Output available.' : 'No output yet.');
   if (text === lastText) return;
   const el = $('#reader'), stick = lastText === null || readerFollow || nearBottom(el);
   lastText = text;
@@ -385,6 +403,7 @@ function startReader() {
   readerFollow = true;
   readerHeight = $('#reader').clientHeight;
   $('#reader').textContent = 'Loading…';
+  readerState('Loading session output…', true);
   fitSession();
   pullReader();
   readTimer = setInterval(pullReader, 1500);
@@ -566,6 +585,10 @@ $('#input-row').onsubmit = async (e) => {
   const sent = [...c.pending];
   const text = [draft.trim(), ...sent.map((p) => p.path)].filter(Boolean).join('\n');
   if (!text) return;
+  if (text.length > MESSAGE_MAX_CHARS) {
+    sessionDelivery(name, 'Message is too long. Use 20,000 characters or fewer including attachment paths; your draft is kept.', true);
+    return;
+  }
   sending.add(name);
   $('#send-btn').disabled = true; $('#send-btn').textContent = 'Sending…';
   sessionDelivery(name, 'Sending to terminal…');
@@ -578,7 +601,9 @@ $('#input-row').onsubmit = async (e) => {
     $('#input').value = c.draft; grow(); renderPending();
     if (mode === 'read') { const el = $('#reader'); el.scrollTop = el.scrollHeight; setTimeout(pullReader, 400); }
   } catch (err) {
-    sessionDelivery(name, 'Delivery unconfirmed. Check output before retrying. ' + err.message, true);
+    sessionDelivery(name, err.status === 413
+      ? 'Message not sent. ' + err.message + ' Your draft is kept.'
+      : 'Delivery unconfirmed. Check output before retrying. ' + err.message, true);
   } finally {
     sending.delete(name);
     if (current === name) { $('#send-btn').disabled = false; $('#send-btn').textContent = 'Send'; }

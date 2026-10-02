@@ -12,7 +12,7 @@ test('public/app.js compiles as a script', () => {
   assert.doesNotThrow(() => new vm.Script(src, { filename: 'app.js' }));
 });
 
-function frontend({ failSend = false, failEnd = false, voiceStall = false, voiceBodyStall = false, history = '' } = {}) {
+function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, history = '', historyError = false } = {}) {
   class Element {
     constructor() {
       this.children = []; this.dataset = {}; this.style = {}; this.value = ''; this.hidden = false;
@@ -44,7 +44,7 @@ function frontend({ failSend = false, failEnd = false, voiceStall = false, voice
     documentElement: { dataset: {}, style: { setProperty() {} } }, addEventListener() {},
   };
   const calls = [], uploads = [], terminals = [], sockets = [], timers = [], observers = [];
-  let historyText = history;
+  let historyText = history, failHistory = historyError;
   let finishSend;
   class XHR {
     constructor() { this.upload = {}; uploads.push(this); }
@@ -106,8 +106,8 @@ function frontend({ failSend = false, failEnd = false, voiceStall = false, voice
       };
       if (path === '/api/sessions/a/keys') await new Promise((resolve) => { finishSend = resolve; });
       const body = path === '/api/state' ? { lanes: [], sessions: [], transcribe: false } : {};
-      const failed = (failSend && path === '/api/sessions/a/keys') || (failEnd && path === '/api/sessions/a/end');
-      return { ok: !failed, status: failed ? 503 : 200,
+      const failed = (failHistory && path.includes('/history')) || (failSend && path === '/api/sessions/a/keys') || (failEnd && path === '/api/sessions/a/end');
+      return { ok: !failed, status: failed ? failSendStatus : 200,
         headers: { get: () => path.includes('/history') ? 'text/plain' : 'application/json' },
         json: async () => failed ? { error: 'unavailable' } : body,
         text: async () => path.includes('/history') ? historyText : '' };
@@ -115,7 +115,7 @@ function frontend({ failSend = false, failEnd = false, voiceStall = false, voice
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8'), context);
   return { context, el, calls, uploads, terminals, sockets, timers, observers,
-    setHistory: (text) => { historyText = text; }, finishSend: () => finishSend?.() };
+    setHistory: (text) => { historyText = text; }, setHistoryError: (value) => { failHistory = value; }, finishSend: () => finishSend?.() };
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
@@ -381,4 +381,62 @@ test('active close reconnects once, while a superseded retry cannot duplicate a 
   const nextRetry = h.timers.findLast((t) => t.ms === 1000 && !t.canceled);
   nextRetry.fn();
   assert.equal(h.sockets.length, 3);
+});
+
+
+test('initial history failure reports retrying and recovery updates separate status without announcing transcript', async () => {
+  const h = frontend({ historyError: true });
+  await tick();
+  vm.runInContext("openTerm('a')", h.context);
+  await tick();
+  assert.match(h.el('#reader').textContent, /unavailable.*Retrying/);
+  assert.match(h.el('#reader-state').textContent, /Retrying automatically/);
+  assert.equal(h.el('#reader')['aria-busy'], 'false');
+  h.setHistoryError(false);
+  await vm.runInContext('pullReader()', h.context);
+  assert.equal(h.el('#reader-state').textContent, 'No output yet.');
+  h.setHistory('Recovered response');
+  await vm.runInContext('pullReader()', h.context);
+  assert.equal(h.el('#reader').textContent, 'Recovered response');
+  assert.equal(h.el('#reader-state').textContent, 'Output available.');
+  h.setHistoryError(true);
+  await vm.runInContext('pullReader()', h.context);
+  assert.equal(h.el('#reader').textContent, 'Recovered response', 'failed poll keeps already captured output');
+});
+
+test('oversized composed message including attachment paths keeps draft and never sends', async () => {
+  const h = frontend();
+  await tick();
+  vm.runInContext("openTerm('a'); composer('a').pending.push({name:'sample.txt',path:'/example/sample.txt'})", h.context);
+  h.el('#input').value = 'x'.repeat(19990); h.el('#input').oninput();
+  await h.el('#input-row').onsubmit({ preventDefault() {} });
+  assert.equal(h.calls.filter(c => c.path.endsWith('/keys')).length, 0);
+  assert.equal(h.el('#input').value.length, 19990);
+  assert.equal(vm.runInContext("composer('a').pending.length", h.context), 1);
+  assert.match(h.el('#delivery').textContent, /too long.*including attachment paths/);
+  assert.equal(h.el('#send-btn').disabled, false);
+});
+
+test('oversized initial prompt keeps draft and never creates a session', async () => {
+  const h = frontend();
+  await tick();
+  h.el('#prompt').value = 'x'.repeat(8001);
+  h.el('#start-btn').disabled = false;
+  await h.el('#start-btn').click();
+  assert.equal(h.calls.filter(c => c.path === '/api/sessions').length, 0);
+  assert.equal(h.el('#prompt').value.length, 8001);
+  assert.match(h.el('#new-err').textContent, /too long/);
+});
+
+
+test('explicit server length rejection reports not sent and retains the draft', async () => {
+  const h = frontend({failSend: true, failSendStatus: 413});
+  await tick();
+  vm.runInContext("openTerm('a')", h.context);
+  h.el('#input').value = 'keep me'; h.el('#input').oninput();
+  const send = h.el('#input-row').onsubmit({preventDefault(){}});
+  await tick(); h.finishSend(); await send;
+  assert.equal(h.el('#input').value, 'keep me');
+  assert.match(h.el('#delivery').textContent, /Message not sent.*draft is kept/);
+  assert.doesNotMatch(h.el('#delivery').textContent, /unconfirmed/);
 });

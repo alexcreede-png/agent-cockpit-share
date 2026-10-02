@@ -16,7 +16,7 @@ const names = ['codex-example-project-alpha-1234', 'grok-example-project-beta-56
 const output = Array.from({ length: 90 }, (_, i) => `Output line ${i + 1}: readable text should wrap inside the session, with enough room for the message composer.`).join('\n');
 let fixture;
 function reset() {
-  fixture = { offline: false, endError: false, sendError: false, projectError: false, history: output, uploadPending: null,
+  fixture = { offline: false, historyError: false, endError: false, sendError: false, projectError: false, history: output, uploadPending: null,
     holdUpload: false, holdSend: false, sendPending: null, transcribePending: null, connections: [], sent: [], sessions: names.map((name, i) => ({ name, lane: i ? 'grok' : 'codex', project: `/example/${i ? 'beta' : 'alpha'}`, created: Date.now(), status: i ? 'needs-you' : 'idle' })) };
 }
 const files = {
@@ -44,12 +44,12 @@ const server = http.createServer(async (req, res) => {
   if (fixture.offline) return reply(503, { error: 'Synthetic offline check' });
   if (url.pathname === '/api/state') return reply(200, { lanes: ['codex', 'grok', 'shell'], sessions: fixture.sessions, projectsRoot: '/example', uploadMaxMB: 2, transcribe: true });
   if (url.pathname === '/api/transcribe') { for await (const _chunk of req) {} fixture.transcribePending = () => reply(200, { text: 'dictated for alpha' }); return; }
-  if (url.pathname === '/api/projects') return fixture.projectError ? reply(503, { error: 'Project list unavailable' }) : reply(200, [{ path: '/example/alpha', label: 'Alpha project' }, { path: '/example/beta', label: 'Beta project' }]);
+  if (url.pathname === '/api/projects') return fixture.projectError ? reply(503, { error: 'Project list unavailable' }) : reply(200, [{ path: '/example/alpha', label: 'Alpha project' }, { path: '/example/beta', label: 'Beta project' }, { path: '/example/long', label: 'Example-' + 'architecture'.repeat(12) }]);
   if (url.pathname === '/api/sessions' && req.method === 'POST') return reply(200, { name: names[0] });
   const match = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(history|keys|end|size|upload)$/);
   if (!match) return reply(404, { error: 'Not found' });
   const [, name, action] = match;
-  if (action === 'history') return reply(200, fixture.history, 'text/plain; charset=utf-8');
+  if (action === 'history') return fixture.historyError ? reply(503, {error:'Synthetic history failure'}) : reply(200, fixture.history, 'text/plain; charset=utf-8');
   if (action === 'keys') {
     let body = ''; for await (const chunk of req) body += chunk;
     fixture.sent.push({ name, ...JSON.parse(body) });
@@ -207,7 +207,21 @@ async function run(engineName, engine) {
     await frame.locator('#projects').getByRole('button', { name: /Alpha project/i }).click();
     assert.equal(await frame.locator('#start-btn').isEnabled(), true);
     await page.screenshot({ path: path.join(artifacts, `${engineName}-new.png`) });
+    const pickerBox = await frame.locator('#projects').evaluate(el => ({width:el.clientWidth,scrollWidth:el.scrollWidth}));
+    assert.ok(pickerBox.scrollWidth <= pickerBox.width, JSON.stringify(pickerBox));
+    await frame.locator('#prompt').fill('x'.repeat(8001));
+    await frame.locator('#start-btn').click();
+    await frame.locator('#new-err').filter({hasText:'too long'}).waitFor();
+    assert.equal((await frame.locator('#prompt').inputValue()).length,8001);
+    await frame.locator('#prompt').fill('');
     await frame.locator('#start-btn').click(); await frame.locator('#term-view').waitFor({state:'visible'});
+    const sendsBeforeLengthCheck = fixture.sent.length;
+    await frame.locator('#input').fill('x'.repeat(20001));
+    await frame.locator('#send-btn').click();
+    await frame.locator('#delivery.error').filter({hasText:'too long'}).waitFor();
+    assert.equal(fixture.sent.length, sendsBeforeLengthCheck);
+    assert.equal((await frame.locator('#input').inputValue()).length,20001);
+    await frame.locator('#input').fill('');
     fixture.offline = true; await pause(3300);
     assert.match(await frame.locator('#connection-state').innerText(), /offline|retry|connect|unreachable/i);
     fixture.offline = false; await pause(3300);
@@ -264,9 +278,15 @@ async function run(engineName, engine) {
     assert.ok(sparseTail.gap >= 0 && sparseTail.gap <= 50, JSON.stringify(sparseTail));
 
     fixture.history = '';
+    fixture.historyError = true;
     await frame.locator('#mode-btn').click(); await frame.locator('#mode-btn').click();
+    await frame.locator('#reader').filter({hasText:'Output unavailable. Retrying…'}).waitFor();
+    assert.match(await frame.locator('#reader-state').textContent(), /Retrying automatically/);
+    fixture.historyError = false;
     await waitUntil(async () => await frame.locator('#reader').innerText() === 'No output yet.', 'successful empty capture');
     assert.equal(await frame.locator('#connection-state').getAttribute('data-state'), 'connected');
+    assert.equal(await frame.locator('#reader-state').textContent(), 'No output yet.');
+    assert.equal(await frame.locator('#reader').getAttribute('aria-live'), null, 'transcript stays out of live announcements');
     fixture.history = 'New response\nPrompt>';
     await frame.locator('#reader').filter({ hasText: 'New response' }).waitFor();
     fixture.history = output;
@@ -321,6 +341,9 @@ async function run(engineName, engine) {
     await frame.locator('#keys').getByRole('button', { name: 'Submit current terminal input' }).click();
     await waitUntil(() => fixture.sent.at(-1)?.key === 'Enter', 'short-frame Enter key');
     assert.equal(await keysToggle.getAttribute('aria-expanded'), 'false');
+    const hitBounds = await frame.locator('#term-view').evaluate(view => Array.from(view.querySelectorAll('.bar button, .input-row button')).filter(b => b.getBoundingClientRect().height > 0).map(b => ({label:b.getAttribute('aria-label') || b.textContent.trim(),width:b.getBoundingClientRect().width,height:b.getBoundingClientRect().height})));
+    for (const hit of hitBounds) assert.ok(hit.width >=44 && hit.height>=44, JSON.stringify(hit));
+    console.log(engineName, 'short-frame primary hit targets:', JSON.stringify(hitBounds));
     await page.screenshot({ path: path.join(artifacts, `${engineName}-short-frame.png`) });
     assert.deepEqual(errors, []);
     console.log(`${engineName}: keyboard/focus, drafts, delayed upload/timeout recovery, failed send/end, scroll, live reconnect/session isolation, responsive layouts, crowded short frame and new-session flow PASS`);
