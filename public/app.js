@@ -320,6 +320,8 @@ function setMode(m) {
   $('#mode-btn').textContent = m === 'read' ? 'Live' : 'Read';
   $('#mode-btn').setAttribute('aria-label', m === 'read' ? 'Switch to live terminal' : 'Switch to readable output');
   $('#reader').hidden = m !== 'read';
+  $('#answer-start').hidden = true;
+  $('#reader-tools').hidden = true;
   $('#term').hidden = m !== 'live';
   $('#to-bottom').hidden = true;
   if (m === 'read') { stopLive(); startReader(); } else { stopReader(); startLive(); }
@@ -356,6 +358,51 @@ function fitSession() {
 // --- read view
 const nearBottom = (el) => el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
 let readerHeight = 0, readerFollow = true;
+function renderConversation(el, messages) {
+  el.classList.add('conversation');
+  $('#reader-tools').hidden = false;
+  const existing = new Map(Array.from(el.children).map(n => [n.dataset.messageId, n]));
+  if (!el.querySelector('.message')) el.textContent = '';
+  for (const message of messages) {
+    let node = existing.get(message.id);
+    if (!node) {
+      node = document.createElement('article');
+      node.className = 'message ' + (message.role === 'user' ? 'user' : 'assistant');
+      node.dataset.messageId = message.id;
+      const label = document.createElement('div'); label.className = 'message-label';
+      label.textContent = message.role === 'user' ? 'You' : 'Assistant';
+      const body = document.createElement('div'); body.className = 'message-body';
+      node.append(label, body); el.appendChild(node);
+    }
+    existing.delete(message.id);
+    node.className = 'message ' + (message.role === 'user' ? 'user' : 'assistant');
+    node.querySelector('.message-label').textContent = message.role === 'user' ? 'You' : 'Assistant';
+    const body = node.querySelector('.message-body');
+    if (body.dataset.text !== message.text) {
+      body.dataset.text = message.text;
+      body.textContent = '';
+      const blocks = message.text.split(/```[^\n]*\n([\s\S]*?)(?:```|$)/g);
+      blocks.forEach((text, i) => {
+        const block = document.createElement(i % 2 ? 'pre' : 'div');
+        block.textContent = text; body.appendChild(block);
+      });
+    }
+  }
+  for (const node of existing.values()) node.remove();
+  if (!messages.length) el.textContent = 'Your conversation will appear here.';
+  $('#answer-start').hidden = !messages.some(m => m.role === 'assistant');
+}
+function latestAnswerStart() {
+  const el = $('#reader'), answers = el.querySelectorAll('.message.assistant');
+  if (!answers.length) return;
+  readerFollow = false;
+  el.scrollTop = Math.max(0, answers[answers.length - 1].offsetTop - 12);
+  $('#to-bottom').hidden = nearBottom(el);
+}
+$('#answer-start').onclick = latestAnswerStart;
+$('#answer-start').addEventListener('pointerdown', e => {
+  if (document.activeElement === $('#input')) { e.preventDefault(); latestAnswerStart(); }
+});
 function compactReadHistory(text) {
   const out = [], blank = [];
   const flush = () => { out.push(...(blank.length >= 4 ? ['', ''] : blank)); blank.length = 0; };
@@ -377,7 +424,7 @@ async function pullReader() {
   readerBusy = true;
   let text;
   try {
-    text = await api(`/api/sessions/${name}/history?lines=3000`);
+    text = await api(`/api/sessions/${name}/history?lines=3000&format=reader`);
     if (name === current && epoch === readerEpoch) { note(''); connection('connected'); }
   } catch {
     if (name === current && epoch === readerEpoch) {
@@ -388,7 +435,9 @@ async function pullReader() {
     return;
   } finally { if (epoch === readerEpoch) readerBusy = false; }
   if (name !== current || mode !== 'read' || epoch !== readerEpoch) return;
-  text = compactReadHistory(text);
+  const conversation = text && typeof text === 'object' && text.source === 'conversation' && Array.isArray(text.messages) ? text : null;
+  const messages = conversation ? conversation.messages : null;
+  text = conversation ? JSON.stringify(messages) : compactReadHistory(typeof text === 'string' ? text : '');
   readerState(text ? 'Output available.' : 'No output yet.');
   const el = $('#reader'), resized = el.clientHeight !== readerHeight;
   readerHeight = el.clientHeight;
@@ -397,10 +446,24 @@ async function pullReader() {
     return;
   }
   const stick = lastText === null || readerFollow || nearBottom(el);
+  const first = lastText === null, oldTop = el.scrollTop;
   lastText = text;
-  el.textContent = text || 'No output yet.';
-  if (stick) el.scrollTop = el.scrollHeight;
-  readerFollow = stick;
+  if (conversation) {
+    renderConversation(el, messages);
+    if (first) latestAnswerStart();
+    else {
+      // Keep the start of a growing answer readable instead of chasing its last line.
+      el.scrollTop = oldTop;
+      readerFollow = nearBottom(el);
+    }
+  } else {
+    el.classList.remove('conversation');
+    $('#answer-start').hidden = true;
+    $('#reader-tools').hidden = true;
+    el.textContent = text || 'No output yet.';
+    if (stick) el.scrollTop = el.scrollHeight;
+    readerFollow = stick;
+  }
   $('#to-bottom').hidden = nearBottom(el);
 }
 function startReader() {
@@ -408,6 +471,9 @@ function startReader() {
   lastText = null;
   readerFollow = true;
   readerHeight = $('#reader').clientHeight;
+  $('#reader').classList.remove('conversation');
+  $('#answer-start').hidden = true;
+  $('#reader-tools').hidden = true;
   $('#reader').textContent = 'Loading…';
   readerState('Loading session output…', true);
   fitSession();
@@ -433,6 +499,16 @@ $('#to-bottom').addEventListener('pointerdown', (e) => {
   scrollReaderToBottom();
 });
 $('#to-bottom').onclick = scrollReaderToBottom;
+// WKWebView can perform a separate mouse/touch focus transfer after pointerdown.
+for (const [button, action] of [[$('#to-bottom'), scrollReaderToBottom], [$('#answer-start'), latestAnswerStart]]) {
+  button.addEventListener('mousedown', e => e.preventDefault());
+  button.addEventListener('touchstart', e => {
+    if (document.activeElement === $('#input')) {
+      e.preventDefault(); action(); $('#input').focus({ preventScroll: true });
+    }
+  }, { passive: false });
+}
+
 // Preserve an at-bottom view when the keyboard changes the iframe height.
 new ResizeObserver(() => {
   if (!current || mode !== 'read') return;

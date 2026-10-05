@@ -173,3 +173,19 @@ node scripts/verify-delivery.cjs
 ```
 
 This uses a synthetic terminal fixture on a unique tmux server. It verifies actual single-line and multiline submissions, rendered replies, resize/focus behavior, and cleanup without accessing existing sessions. Use the same optional browser executable overrides as the UI suite.
+
+### Reading complete Grok answers
+
+Read view uses Grok's saved user/assistant conversation when its active-session registry matches
+both the cockpit pane process and project directory. This shows complete, naturally wrapping
+messages instead of the TUI's clipped viewport. Answer start returns to the latest answer;
+new output preserves your reading position. Phone terminal keys stay behind Keys, and Live
+remains available for exact terminal interaction.
+
+Only the bound conversation's `updates.jsonl` is read. System prompts, thinking, tool inputs,
+and tool outputs are excluded. No newest-session guess or transcript-directory scan is used.
+Other lanes and unavailable/unsupported Grok histories retain terminal Read view. The adapter
+supports the standard encoded-project directory layout, up to 32 MiB of events and 2 MiB of
+message text; it falls back instead of silently truncating. Bindings survive an agent exit while
+the server remains running, but are rediscovered from active processes after a server restart.
+Set `grokHome` in the local configuration only when Grok uses a nonstandard home directory.

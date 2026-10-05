@@ -49,7 +49,7 @@ const server = http.createServer(async (req, res) => {
   const match = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(history|keys|end|size|upload)$/);
   if (!match) return reply(404, { error: 'Not found' });
   const [, name, action] = match;
-  if (action === 'history') return fixture.historyError ? reply(503, {error:'Synthetic history failure'}) : reply(200, fixture.history, 'text/plain; charset=utf-8');
+  if (action === 'history') return fixture.historyError ? reply(503, {error:'Synthetic history failure'}) : reply(200, fixture.history, typeof fixture.history === 'string' ? 'text/plain; charset=utf-8' : 'application/json');
   if (action === 'keys') {
     let body = ''; for await (const chunk of req) body += chunk;
     fixture.sent.push({ name, ...JSON.parse(body) });
@@ -112,6 +112,25 @@ async function run(engineName, engine) {
     assert.equal(await alpha().evaluate(el => document.activeElement === el), true, 'polling preserves session-button focus');
     await alpha().press('Enter');
     await frame.locator('#reader').waitFor({ state: 'visible' });
+    const longAnswer = 'BEGINNING OF COMPLETE ANSWER\n\n' + Array.from({length: 120}, (_,i) => `Paragraph ${i+1}. This is readable prose that uses the available phone width without terminal indentation or clipped columns.`).join('\n\n') + '\n\nEND OF COMPLETE ANSWER';
+    fixture.history = {source:'conversation',messages:[{id:'0',role:'user',text:'Please write a long answer.'},{id:'1',role:'assistant',text:longAnswer}]};
+    await frame.locator('#reader.conversation').waitFor();
+    assert.match(await frame.locator('#reader').innerText(), /BEGINNING OF COMPLETE ANSWER/);
+    assert.match(await frame.locator('#reader').innerText(), /END OF COMPLETE ANSWER/);
+    await frame.locator('#answer-start').click();
+    const readingTop = await frame.locator('#reader').evaluate(el=>el.scrollTop);
+    fixture.history.messages[1].text += '\n\nMore text arriving while you read.';
+    await waitUntil(async()=> (await frame.locator('#reader').innerText()).includes('More text arriving'), 'structured update');
+    assert.equal(await frame.locator('#reader').evaluate(el=>el.scrollTop), readingTop, 'streaming preserves the reading position');
+    const prose = await frame.locator('.message.assistant .message-body').evaluate(el=>({width:el.clientWidth,font:getComputedStyle(el).fontFamily}));
+    assert.ok(prose.width > 300, 'phone answer uses available width');
+    assert.ok(!prose.font.includes('monospace'), 'prose uses readable system font');
+    assert.equal(await frame.locator('#keys').isVisible(),false,'terminal keys are tucked away on phone');
+    await page.screenshot({path:path.join(artifacts,`${engineName}-conversation-start.png`)});
+    await frame.locator('#reader').evaluate(el=>el.scrollTop=el.scrollHeight);
+    await page.screenshot({path:path.join(artifacts,`${engineName}-conversation-end.png`)});
+    fixture.history = output;
+    await waitUntil(async()=> !(await frame.locator('#reader').getAttribute('class')||'').includes('conversation'),'terminal fallback');
     await frame.locator('#input').fill('Alpha draft');
     await frame.locator('[data-go="list"]:visible').click(); await beta().click();
     assert.equal(await frame.locator('#input').inputValue(), '', 'new session starts with its own draft');
@@ -226,7 +245,7 @@ async function run(engineName, engine) {
     assert.match(await frame.locator('#connection-state').innerText(), /offline|retry|connect|unreachable/i);
     fixture.offline = false; await pause(3300);
     assert.doesNotMatch(await frame.locator('#connection-state').innerText(), /offline|lost/i);
-    assert.equal(await frame.locator('#keys-toggle').isVisible(), false, 'normal frame keeps the regular key row');
+    assert.equal(await frame.locator('#keys-toggle').isVisible(), true, 'phone keeps terminal keys behind one control');
     const resizeFrame = async (height) => {
       await page.locator('iframe').evaluate((el, px) => { el.style.height = `${px}px`; }, height);
       await waitUntil(async () => await frame.locator('#term-view').evaluate(el =>

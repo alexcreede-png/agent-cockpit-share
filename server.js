@@ -15,6 +15,8 @@ const uploads = require('./lib/uploads');
 const voice = require('./lib/transcribe');
 const config = require('./lib/config').load();
 
+const readConversation = require('./lib/reader').createReader({ grokHome: config.grokHome, paneIdentity: tmux.paneIdentity });
+
 const PORT = config.port;
 const PUBLIC_HOST = config.publicHost;
 const LOCAL_HOSTS = [`127.0.0.1:${PORT}`, `localhost:${PORT}`];
@@ -142,6 +144,11 @@ async function handle(req, res) {
     const s = await requireSession(m[1]);
     if (!s) return send(res, 404, { error: 'no such session' });
     if (req.method === 'GET' && m[2] === 'history') {
+      if (url.searchParams.get('format') === 'reader') {
+        let conversation = null;
+        try { if (guard.resolveProject(s.project, config)) conversation = await readConversation(s); } catch { /* Fall back without exposing local paths. */ }
+        if (conversation) return send(res, 200, conversation);
+      }
       const lines = Math.min(Math.max(Number(url.searchParams.get('lines')) || 2000, 50), 20000);
       return send(res, 200, await tmux.capture(s.name, lines), 'text/plain; charset=utf-8');
     }

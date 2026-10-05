@@ -71,9 +71,10 @@
     <button id="mode-btn" aria-label="Switch to live terminal">Live</button>
     <button id="kill-btn" class="danger">End</button>
   </header>
+  <div id="reader-tools" class="reader-tools" hidden><span>Conversation</span><button id="answer-start" hidden>↑ Answer start</button></div>
   <div class="stage">
     <p id="reader-state" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
-    <pre id="reader" tabindex="0" aria-label="Session output"></pre>
+    <div id="reader" tabindex="0" aria-label="Session output"></div>
     <div id="term" hidden></div>
     <button id="to-bottom" class="float" hidden>↓ Latest</button>
     <div id="conn-note" class="note" hidden></div>
