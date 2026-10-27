@@ -19,13 +19,13 @@
 <section id="list-view" class="view">
   <header class="bar">
     <h1>Cockpit</h1>
-    <span id="summary" class="muted"></span>
-    <button id="new-btn" class="primary">+ New</button>
+    <button id="new-btn" class="primary">New task</button>
   </header>
-  <div class="list-tools"><label for="session-search">Sessions</label><input id="session-search" type="search" placeholder="Find a session" autocomplete="off"></div>
+  <div class="home-heading"><h2>Your tasks</h2><p id="summary" class="muted">Tasks run on your Mac.</p></div>
+  <div class="list-tools"><label class="sr-only" for="session-search">Search tasks</label><input id="session-search" type="search" placeholder="Search tasks or projects" autocomplete="off"></div>
   <ul id="sessions"></ul>
   <p id="list-state" class="muted center" role="status">Loading sessions…</p>
-  <p id="empty" class="muted center" hidden>No sessions yet. Tap <b>+ New</b> to start one.</p>
+  <div id="empty" class="empty-state" hidden><span class="empty-symbol" aria-hidden="true">＋</span><h2>Start something on your Mac</h2><p>Choose Grok or Gemini / Antigravity, pick a project, and describe your task.</p><p>Your tasks run on the Mac and keep running when you leave this app. Return here to read and reply.</p><button id="empty-new-btn" class="primary">New task</button></div>
   <p id="conn" class="warn center" role="alert" hidden>Can’t reach the Mac. Reconnecting…</p>
 </section>
 
@@ -44,19 +44,36 @@
 <section id="new-view" class="view" hidden>
   <header class="bar">
     <button class="back" data-go="list">‹ Back</button>
-    <h1>New session</h1>
+    <h1>New task</h1>
   </header>
   <div class="form">
-    <label id="lane-label">Lane</label>
-    <div id="lanes" class="chips" role="group" aria-labelledby="lane-label"></div>
-    <label for="project-filter">Project</label>
-    <input id="project-filter" placeholder="Filter projects…" autocomplete="off" autocapitalize="off">
-    <ul id="projects" class="pick"></ul>
-    <p id="project-state" class="muted" role="status"></p>
-    <label for="prompt">First message (optional)</label>
-    <textarea id="prompt" rows="3" placeholder="What should it do? Dictation works here."></textarea>
-    <button id="start-btn" class="primary wide" disabled>Start</button>
+    <p class="form-intro">Start on your Mac. Come back whenever you’re ready.</p>
+    <section class="form-section" aria-labelledby="lane-label">
+      <h2 id="lane-label"><span>1</span> Choose an assistant</h2>
+      <div id="lanes" class="assistant-choices" role="group" aria-labelledby="lane-label"></div>
+      <details id="more-assistants"><summary>More assistants</summary><div id="other-lanes" class="assistant-choices" role="group" aria-label="More assistants"></div></details>
+      <p id="assistant-help" class="field-help">Choose who you’d like to work with.</p>
+    </section>
+    <section class="form-section" aria-labelledby="project-label">
+      <h2 id="project-label"><span>2</span> Choose a project</h2>
+      <p id="selected-project" class="selected-project" role="status">No project selected</p>
+      <label class="sr-only" for="project-filter">Search projects</label>
+      <input id="project-filter" type="search" placeholder="Search projects" autocomplete="off" autocapitalize="off">
+      <ul id="projects" class="pick" aria-label="Projects"></ul>
+      <p id="project-state" class="field-help" role="status"></p>
+      <button id="retry-projects" class="text-button" hidden>Try loading projects again</button>
+    </section>
+    <section class="form-section" aria-labelledby="prompt-label">
+      <h2 id="prompt-label"><span>3</span> Your first message</h2>
+      <label class="sr-only" for="prompt">First message (optional)</label>
+      <textarea id="prompt" rows="3" placeholder="What would you like help with?" aria-describedby="prompt-help"></textarea>
+      <p id="prompt-help" class="field-help">Optional. Leave this blank to open the assistant and write your message there.</p>
+    </section>
+  </div>
+  <div class="launch-footer">
+    <p id="start-state" class="field-help" role="status" aria-live="polite"></p>
     <p id="new-err" class="warn" role="alert"></p>
+    <button id="start-btn" class="primary wide" disabled>Choose an assistant</button>
   </div>
 </section>
 

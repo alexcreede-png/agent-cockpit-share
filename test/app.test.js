@@ -12,7 +12,7 @@ test('public/app.js compiles as a script', () => {
   assert.doesNotThrow(() => new vm.Script(src, { filename: 'app.js' }));
 });
 
-function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, history = '', historyError = false } = {}) {
+function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, history = '', historyError = false, createFlow = false } = {}) {
   class Element {
     constructor() {
       this.children = []; this.dataset = {}; this.style = {}; this.value = ''; this.hidden = false;
@@ -45,6 +45,8 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
   };
   const calls = [], uploads = [], terminals = [], sockets = [], timers = [], observers = [];
   let historyText = history, failHistory = historyError;
+  const setup = { projectError: false, createError: false, holdCreate: false, finishCreate: null };
+  const exampleProjects = [{path:'/example/alpha',label:'Alpha project'},{path:'/example/beta',label:'Beta project'}];
   let finishSend;
   class XHR {
     constructor() { this.upload = {}; uploads.push(this); }
@@ -105,8 +107,12 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
         }),
       };
       if (path === '/api/sessions/a/keys') await new Promise((resolve) => { finishSend = resolve; });
-      const body = path === '/api/state' ? { lanes: [], sessions: [], transcribe: false } : {};
-      const failed = (failHistory && path.includes('/history')) || (failSend && path === '/api/sessions/a/keys') || (failEnd && path === '/api/sessions/a/end');
+      if (createFlow && path === '/api/sessions' && setup.holdCreate) {
+        await new Promise(resolve => { setup.finishCreate = resolve; });
+      }
+      const body = path === '/api/state' ? { lanes: createFlow ? ['claude','codex','grok','agy','shell'] : [], sessions: [], transcribe: false }
+        : path === '/api/projects' ? exampleProjects : path === '/api/sessions' ? {name:'synthetic-created'} : {};
+      const failed = (setup.projectError && path === '/api/projects') || (setup.createError && path === '/api/sessions') || (failHistory && path.includes('/history')) || (failSend && path === '/api/sessions/a/keys') || (failEnd && path === '/api/sessions/a/end');
       return { ok: !failed, status: failed ? failSendStatus : 200,
         headers: { get: () => path.includes('/history') ? 'text/plain' : 'application/json' },
         json: async () => failed ? { error: 'unavailable' } : body,
@@ -114,7 +120,7 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
     },
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8'), context);
-  return { context, el, calls, uploads, terminals, sockets, timers, observers,
+  return { context, el, calls, uploads, terminals, sockets, timers, observers, setup,
     setHistory: (text) => { historyText = text; }, setHistoryError: (value) => { failHistory = value; }, finishSend: () => finishSend?.() };
 }
 
@@ -311,7 +317,7 @@ test('project identity is readable while full session name stays accessible', ()
   vm.runInContext("projectsRoot = '/example/projects'; renderTermIdentity({ name: 'codex-agent-cockpit-1234', lane: 'codex', project: '/example/projects/agent-cockpit', status: 'working' }, 'codex-agent-cockpit-1234')", h.context);
   assert.equal(h.el('#t-name').textContent, 'agent-cockpit');
   assert.match(h.el('#t-name')['aria-label'], /codex-agent-cockpit-1234/);
-  assert.equal(h.el('#t-context').textContent, 'codex · 1234');
+  assert.equal(h.el('#t-context').textContent, 'Codex');
 });
 
 test('late socket and terminal events cannot cross into another session or a reopened view', () => {
@@ -482,4 +488,93 @@ test('captured Read geometry accepts immediate scrollback and unchanged polling 
   assert.equal(reader.scrollTop,1000,'same text polling follows shrink before pending observer');
   h.observers.find(o=>o.element===reader).fn();
   assert.equal(reader.scrollTop,1000);
+});
+
+
+// Exercise actual app handlers with a synthetic HTTP boundary; layout/hit targets live in verify-ui.
+async function setupTask() {
+  const h = frontend({createFlow:true});
+  await tick(); h.el('#new-btn').click(); await tick();
+  h.el('#lanes').children.find(b => b.dataset.lane === 'grok').click();
+  h.el('#projects').children[0].firstElementChild.click();
+  return h;
+}
+
+test('setup uses human assistant names, keeps other choices available and retains project while searching', async () => {
+  const h = await setupTask();
+  assert.deepEqual(h.el('#lanes').children.map(b => b.textContent), ['Grok','Gemini / Antigravity']);
+  assert.deepEqual(h.el('#other-lanes').children.map(b => b.textContent), ['Claude','Codex','Terminal']);
+  h.el('#project-filter').value = 'Beta'; h.el('#project-filter').oninput();
+  assert.equal(h.el('#projects').children.length,1);
+  assert.match(h.el('#selected-project').textContent,/Alpha project/);
+  assert.equal(h.el('#start-btn').disabled,false);
+  assert.equal(h.calls.filter(c=>c.path === '/api/sessions').length,0);
+});
+
+test('failed create retains project, assistant and draft, with safe uncertain-delivery guidance', async () => {
+  const h = await setupTask();
+  h.el('#prompt').value = 'Please help in Alpha'; h.setup.createError = true;
+  await h.el('#start-btn').click();
+  const request = h.calls.find(c=>c.path === '/api/sessions');
+  assert.deepEqual(JSON.parse(request.opts.body),{lane:'grok',project:'/example/alpha',prompt:'Please help in Alpha'});
+  assert.equal(h.el('#prompt').value,'Please help in Alpha');
+  assert.match(h.el('#selected-project').textContent,/Alpha project/);
+  assert.equal(h.el('#lanes').children[0]['aria-pressed'],'true');
+  assert.equal(h.el('#start-btn').disabled,false);
+  assert.match(h.el('#new-err').textContent,/Check Your tasks before trying again/);
+  assert.doesNotMatch(h.el('#new-err').textContent,/unavailable/);
+});
+
+test('project refetch failure and inline retry preserve choices and first message', async () => {
+  const h = await setupTask();
+  h.el('#prompt').value = 'Retained draft';
+  h.setup.projectError = true; h.el('#new-btn').click(); await tick();
+  assert.equal(h.el('#retry-projects').hidden,false);
+  assert.equal(h.el('#start-btn').disabled,true);
+  assert.match(h.el('#selected-project').textContent,/Alpha project/);
+  h.setup.projectError = false; await h.el('#retry-projects').click();
+  assert.equal(h.el('#retry-projects').hidden,true);
+  assert.equal(h.el('#start-btn').disabled,false);
+  assert.equal(h.el('#prompt').value,'Retained draft');
+});
+
+test('Gemini choice posts agy and a late successful create cannot replace another view', async () => {
+  const h = await setupTask();
+  h.el('#lanes').children.find(b=>b.dataset.lane==='agy').click();
+  h.el('#prompt').value = 'Gemini task'; h.setup.holdCreate = true;
+  const launch = h.el('#start-btn').click(); await tick();
+  assert.deepEqual(JSON.parse(h.calls.find(c=>c.path==='/api/sessions').opts.body), {lane:'agy',project:'/example/alpha',prompt:'Gemini task'});
+  vm.runInContext("show('list')",h.context);
+  h.setup.finishCreate(); await launch;
+  assert.equal(h.el('#list-view').hidden,false);
+  assert.equal(h.el('#term-view').hidden,true);
+});
+
+test('Terminal launches without a prompt and keeps a draft for returning to an assistant', async () => {
+  const h = await setupTask();
+  h.el('#prompt').value = 'Keep for Grok';
+  h.el('#other-lanes').children.find(b=>b.dataset.lane==='shell').click();
+  assert.equal(h.el('#prompt').disabled,true);
+  await h.el('#start-btn').click();
+  assert.deepEqual(JSON.parse(h.calls.find(c=>c.path==='/api/sessions').opts.body), {lane:'shell',project:'/example/alpha',prompt:''});
+  h.el('#new-btn').click(); await tick();
+  h.el('#lanes').children.find(b=>b.dataset.lane==='grok').click();
+  assert.equal(h.el('#prompt').disabled,false);
+  assert.equal(h.el('#prompt').value,'Keep for Grok');
+});
+
+
+test('opening setup before initial state arrives fills assistant choices when state recovers', async () => {
+  const h = frontend({createFlow:true});
+  h.el('#new-btn').click();
+  assert.equal(h.el('#lanes').children.length,0);
+  await tick();
+  assert.deepEqual(h.el('#lanes').children.map(b=>b.textContent),['Grok','Gemini / Antigravity']);
+});
+
+test('an assistant can open without a first message', async () => {
+  const h = await setupTask();
+  await h.el('#start-btn').click();
+  assert.deepEqual(JSON.parse(h.calls.find(c=>c.path==='/api/sessions').opts.body),{lane:'grok',project:'/example/alpha',prompt:''});
+  assert.equal(h.el('#term-view').hidden,false);
 });

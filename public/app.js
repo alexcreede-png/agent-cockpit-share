@@ -1,6 +1,14 @@
 'use strict';
 const $ = (s) => document.querySelector(s);
-const STATUS_LABEL = { working: 'working', 'needs-you': 'needs you', idle: 'idle', exited: 'exited' };
+const STATUS_LABEL = { working: 'Working', 'needs-you': 'Needs you', idle: 'Idle', exited: 'Ended' };
+const ASSISTANTS = {
+  grok: { name: 'Grok', hint: 'Work with Grok in your project.' },
+  agy: { name: 'Gemini / Antigravity', hint: 'Opens Antigravity on your Mac. Its selected model may vary.' },
+  claude: { name: 'Claude', hint: 'Work with Claude in your project.' },
+  codex: { name: 'Codex', hint: 'Work with Codex in your project.' },
+  shell: { name: 'Terminal', hint: 'Advanced: opens a command line on your Mac.' },
+};
+const assistantName = (lane) => ASSISTANTS[lane]?.name || lane || 'Assistant';
 const QUICK_KEYS = [['Esc', 'Escape'], ['⏎', 'Enter'], ['↑', 'Up'], ['↓', 'Down'], ['Tab', 'Tab'],
   ['⇧Tab', 'BTab'], ['^C', 'C-c'], ['1', '1'], ['2', '2'], ['3', '3'], ['y', 'y'], ['n', 'n'], ['⌫', 'BSpace']];
 const MESSAGE_MAX_CHARS = 20000, PROMPT_MAX_CHARS = 8000;
@@ -66,7 +74,9 @@ async function api(path, opts = {}) {
 }
 const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body || {}) });
 
+let activeView = 'list', viewEpoch = 0;
 function show(view) {
+  activeView = view; viewEpoch++;
   for (const v of ['list', 'new', 'term', 'pair']) $(`#${v}-view`).hidden = v !== view;
   if (view !== 'term') closeTerm();
   if (view === 'list') { history.replaceState(null, '', '#'); refresh(); }
@@ -85,13 +95,19 @@ const projectLabel = (p) => {
   return root.length > 1 && p.toLowerCase().startsWith(root) ? p.slice(root.length) : p;
 };
 const displayProject = (s) => s && projectLabel(s.project) || s?.name || '';
-const shortSession = (name) => name.split('-').at(-1) || name.slice(-8);
+// Exact start time distinguishes same-project tasks without relying on internal IDs.
+function taskTime(s) {
+  const peers = state.sessions.filter(x => x.project === s.project && x.lane === s.lane);
+  return peers.length > 1 ? new Date(s.created).toLocaleString([], {
+    month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit',
+  }) : ago(s.created);
+}
 
 function renderTermIdentity(s, name = current) {
   $('#t-name').textContent = displayProject(s) || name;
   $('#t-name').title = s ? `${displayProject(s)} — ${name}` : name;
   $('#t-name').setAttribute('aria-label', s ? `${displayProject(s)}, session ${name}` : name);
-  $('#t-context').textContent = s ? `${s.lane || 'session'} · ${shortSession(name)}` : shortSession(name);
+  $('#t-context').textContent = s ? assistantName(s.lane) : 'Starting task';
   const pill = $('#t-status');
   pill.className = 'pill ' + (s ? s.status : 'idle');
   pill.textContent = s ? STATUS_LABEL[s.status] || s.status : 'starting';
@@ -100,7 +116,7 @@ function renderTermIdentity(s, name = current) {
 function renderList() {
   const ul = $('#sessions');
   const q = $('#session-search').value.trim().toLocaleLowerCase();
-  const visible = state.sessions.filter((s) => `${s.name} ${s.lane || ''} ${projectLabel(s.project)}`.toLocaleLowerCase().includes(q));
+  const visible = state.sessions.filter((s) => `${s.name} ${assistantName(s.lane)} ${projectLabel(s.project)}`.toLocaleLowerCase().includes(q));
   const existing = new Map([...ul.children].map((li) => [li.dataset.name, li]));
   visible.forEach((s, index) => {
     let li = existing.get(s.name);
@@ -118,8 +134,8 @@ function renderList() {
     b.querySelector('.name').textContent = displayProject(s);
     b.querySelector('.pill').className = `pill ${s.status}`;
     b.querySelector('.pill').textContent = STATUS_LABEL[s.status] || s.status;
-    b.querySelector('.meta').textContent = `${s.lane || '?'} · ${shortSession(s.name)} · ${ago(s.created)}`;
-    b.setAttribute('aria-label', `${displayProject(s)}, ${STATUS_LABEL[s.status] || s.status}, ${s.lane || 'unknown lane'}, session ${s.name}`);
+    b.querySelector('.meta').textContent = `${assistantName(s.lane)} · ${taskTime(s)}`;
+    b.setAttribute('aria-label', `${displayProject(s)}, ${STATUS_LABEL[s.status] || s.status}, ${assistantName(s.lane)}, session ${s.name}`);
     b.title = `${displayProject(s)} — ${s.name}`;
     if (ul.children[index] !== li) ul.insertBefore(li, ul.children[index] || null);
     existing.delete(s.name);
@@ -130,7 +146,7 @@ function renderList() {
   $('#empty').hidden = state.sessions.length > 0 || !!q;
   const needs = state.sessions.filter((s) => s.status === 'needs-you').length;
   const working = state.sessions.filter((s) => s.status === 'working').length;
-  $('#summary').textContent = state.sessions.length ? `${working} working · ${needs} need you` : '';
+  $('#summary').textContent = state.sessions.length ? `${state.sessions.length} ${state.sessions.length === 1 ? 'task' : 'tasks'} · ${working} working · ${needs} need you` : 'Tasks run on your Mac.';
   document.title = needs ? `(${needs}) Agent Cockpit` : 'Agent Cockpit';
 }
 $('#session-search').oninput = renderList;
@@ -149,7 +165,9 @@ async function refresh() {
   refreshBusy = true;
   try {
     const next = await api('/api/state');
+    const lanesChanged = JSON.stringify(state.lanes) !== JSON.stringify(next.lanes);
     state = next;
+    if (activeView === 'new' && lanesChanged) { renderAssistants(); ready(); }
     projectsRoot = state.projectsRoot || '';
     $('#conn').hidden = true;
     renderList();
@@ -191,80 +209,123 @@ $('#pair-form').onsubmit = async (ev) => {
 
 // ---------- new session ----------
 let pick = { lane: null, project: null }, projects = [], projectsLoading = false, starting = false, projectLoadId = 0;
-$('#new-btn').onclick = async () => {
-  const loadId = ++projectLoadId;
-  show('new');
-  $('#new-err').textContent = '';
-  projectsLoading = true;
-  $('#project-state').textContent = 'Loading projects…';
-  $('#projects').replaceChildren();
-  $('#lanes').replaceChildren(...state.lanes.map((l) => {
+let projectsFailed = false;
+function renderAssistants() {
+  const buttons = (lanes) => lanes.map((lane) => {
     const b = document.createElement('button');
-    b.type = 'button';
-    b.textContent = l;
-    b.className = pick.lane === l ? 'on' : '';
-    b.setAttribute('aria-pressed', String(pick.lane === l));
-    b.onclick = () => {
-      pick.lane = l;
-      [...$('#lanes').children].forEach((c) => { c.classList.toggle('on', c === b); c.setAttribute('aria-pressed', String(c === b)); });
-      ready();
-    };
+    b.type = 'button'; b.textContent = assistantName(lane); b.dataset.lane = lane;
+    b.className = pick.lane === lane ? 'on' : '';
+    b.setAttribute('aria-pressed', String(pick.lane === lane));
+    b.onclick = () => { pick.lane = lane; updateAssistantChoice(); ready(); };
     return b;
-  }));
-  ready();
+  });
+  $('#lanes').replaceChildren(...buttons(['grok', 'agy'].filter((l) => state.lanes.includes(l))));
+  const others = state.lanes.filter((l) => !['grok', 'agy'].includes(l));
+  $('#other-lanes').replaceChildren(...buttons(others));
+  $('#more-assistants').hidden = !others.length;
+  if (others.includes(pick.lane)) $('#more-assistants').open = true;
+  updateAssistantChoice();
+}
+function updateAssistantChoice() {
+  for (const container of [$('#lanes'), $('#other-lanes')]) {
+    for (const b of container.children) {
+      const selected = b.dataset.lane === pick.lane;
+      b.classList.toggle('on', selected); b.setAttribute('aria-pressed', String(selected));
+    }
+  }
+  $('#assistant-help').textContent = !state.lanes.length ? 'Assistants haven’t loaded. Checking the connection to your Mac…'
+    : pick.lane && !state.lanes.includes(pick.lane) ? 'This assistant is unavailable. Choose another assistant.'
+    : ASSISTANTS[pick.lane]?.hint || 'Choose who you’d like to work with.';
+  $('#prompt-help').textContent = pick.lane === 'shell'
+    ? 'Terminal opens without sending a first message. Enter commands after it opens.'
+    : 'Optional. Leave this blank to open the assistant and write your message there.';
+  $('#prompt').disabled = pick.lane === 'shell'; // Keep an existing assistant draft, but never send it to a shell.
+}
+async function loadProjects() {
+  const loadId = ++projectLoadId;
+  projectsLoading = true; projectsFailed = false;
+  $('#retry-projects').hidden = true;
+  renderProjects(); ready();
   try {
     const loaded = await api('/api/projects');
     if (loadId !== projectLoadId) return;
-    projects = loaded;
-    projectsLoading = false;
-    if (pick.project && !projects.some((p) => p.path === pick.project)) pick.project = null;
+    projects = loaded; projectsLoading = false;
     renderProjects(); ready();
-  } catch (err) {
+  } catch {
     if (loadId !== projectLoadId) return;
-    projectsLoading = false;
-    projects = [];
-    $('#project-state').textContent = 'Could not load projects. Go back and try again. ' + err.message;
-    ready();
+    projectsLoading = false; projectsFailed = true;
+    renderProjects(); ready();
   }
+}
+$('#new-btn').onclick = () => {
+  show('new'); renderAssistants(); ready();
+  loadProjects(); // Navigation keeps choices, search and draft; it never starts a task.
 };
+$('#empty-new-btn').onclick = () => $('#new-btn').click();
+$('#retry-projects').onclick = loadProjects;
 function renderProjects() {
-  if (projectsLoading) { $('#project-state').textContent = 'Loading projects…'; return; }
-  const q = $('#project-filter').value.toLowerCase();
-  const matches = projects.filter((p) => p.label.toLowerCase().includes(q));
+  const q = $('#project-filter').value.trim().toLocaleLowerCase();
+  const matches = projects.filter((p) => p.label.toLocaleLowerCase().includes(q));
   $('#projects').replaceChildren(...matches.slice(0, 80).map((p) => {
     const li = document.createElement('li');
     const b = document.createElement('button');
-    b.type = 'button'; b.textContent = p.label;
+    b.type = 'button'; b.textContent = p.label; b.dataset.project = p.path;
     b.className = pick.project === p.path ? 'on' : '';
     b.setAttribute('aria-pressed', String(pick.project === p.path));
     b.onclick = () => {
       pick.project = p.path;
-      $('#projects').querySelectorAll('button').forEach((c) => { c.classList.toggle('on', c === b); c.setAttribute('aria-pressed', String(c === b)); });
+      for (const row of $('#projects').children) {
+        const button = row.firstElementChild, selected = button.dataset.project === pick.project;
+        button.classList.toggle('on', selected); button.setAttribute('aria-pressed', String(selected));
+      }
       ready();
     };
     li.append(b);
     return li;
   }));
-  $('#project-state').textContent = !projects.length ? 'No projects available.' : !matches.length ? 'No matching projects.' : matches.length > 80 ? `Showing first 80 of ${matches.length} projects. Refine your search.` : '';
+  $('#retry-projects').hidden = !projectsFailed;
+  $('#project-state').textContent = projectsLoading ? 'Loading projects…' : projectsFailed
+    ? 'Can’t load projects from the Mac. Your selection is kept. Try again when connected.'
+    : !projects.length ? 'No projects available on the Mac.' : !matches.length ? 'No matching projects. Try another search.'
+    : matches.length > 80 ? `Showing 80 of ${matches.length}. Search to narrow the list.` : '';
 }
-$('#project-filter').oninput = () => { pick.project = null; renderProjects(); ready(); };
-const ready = () => $('#start-btn').disabled = starting || projectsLoading || !(pick.lane && pick.project);
+$('#project-filter').oninput = () => { renderProjects(); ready(); };
+function ready() {
+  const selected = projects.find((p) => p.path === pick.project);
+  $('#selected-project').textContent = pick.project ? `Selected: ${selected?.label || projectLabel(pick.project)}` : 'No project selected';
+  if (pick.project && !selected && !projectsLoading && !projectsFailed) $('#selected-project').textContent += ' (unavailable — choose another project)';
+  $('#selected-project').classList.toggle('has-selection', !!pick.project);
+  const validProject = !!selected && !projectsLoading && !projectsFailed;
+  $('#start-btn').disabled = !!starting || !(state.lanes.includes(pick.lane) && validProject);
+  $('#start-btn').textContent = starting ? `Starting ${assistantName(starting)}…`
+    : pick.lane ? `Open ${assistantName(pick.lane)}` : 'Choose an assistant';
+}
 $('#start-btn').onclick = async () => {
   if (starting || $('#start-btn').disabled) return;
-  if ($('#prompt').value.length > PROMPT_MAX_CHARS) {
+  if (pick.lane !== 'shell' && $('#prompt').value.length > PROMPT_MAX_CHARS) {
     $('#new-err').textContent = 'First message is too long. Use 8,000 characters or fewer; your draft is kept.';
     return;
   }
-  starting = true;
-  $('#start-btn').disabled = true; $('#start-btn').textContent = 'Starting…';
+  const request = { lane: pick.lane, project: pick.project, prompt: pick.lane === 'shell' ? '' : $('#prompt').value };
+  const epoch = viewEpoch;
+  starting = request.lane; ready();
+  $('#start-state').textContent = `Opening ${assistantName(request.lane)} on your Mac. This may take a moment…`;
   $('#new-err').textContent = '';
   try {
-    const { name } = await post('/api/sessions', { lane: pick.lane, project: pick.project, prompt: $('#prompt').value });
-    $('#prompt').value = '';
+    const { name } = await post('/api/sessions', request);
+    if (request.lane !== 'shell' && $('#prompt').value === request.prompt) $('#prompt').value = '';
+    $('#start-state').textContent = `${assistantName(request.lane)} opened. Find it in Your tasks.`;
     await refresh();
-    openTerm(name, { name, lane: pick.lane, project: pick.project, status: 'idle' });
-  } catch (e) { $('#new-err').textContent = 'Could not start: ' + e.message; }
-  finally { starting = false; $('#start-btn').textContent = 'Start'; ready(); }
+    // A late launch must not pull someone out of a different view or task.
+    if (activeView === 'new' && viewEpoch === epoch) {
+      openTerm(name, { name, lane: request.lane, project: request.project, status: 'idle' });
+    }
+  } catch (e) {
+    $('#start-state').textContent = '';
+    $('#new-err').textContent = e.status >= 400 && e.status < 500
+      ? 'Could not open this task. Check your assistant and project, then try again. Your choices and message are kept.'
+      : 'Start wasn’t confirmed. Check Your tasks before trying again. Your choices and message are kept.';
+  } finally { starting = false; ready(); }
 };
 
 // ---------- session view ----------

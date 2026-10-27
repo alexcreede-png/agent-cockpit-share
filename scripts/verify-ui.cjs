@@ -17,7 +17,7 @@ const output = Array.from({ length: 90 }, (_, i) => `Output line ${i + 1}: reada
 let fixture;
 function reset() {
   fixture = { offline: false, historyError: false, endError: false, sendError: false, projectError: false, history: output, uploadPending: null,
-    holdUpload: false, holdSend: false, sendPending: null, transcribePending: null, connections: [], sent: [], sessions: names.map((name, i) => ({ name, lane: i ? 'grok' : 'codex', project: `/example/${i ? 'beta' : 'alpha'}`, created: Date.now(), status: i ? 'needs-you' : 'idle' })) };
+    createError: false, creates: [], holdCreate: false, createPending: null, holdUpload: false, holdSend: false, sendPending: null, transcribePending: null, connections: [], sent: [], sessions: names.map((name, i) => ({ name, lane: i ? 'grok' : 'codex', project: `/example/${i ? 'beta' : 'alpha'}`, created: Date.now(), status: i ? 'needs-you' : 'idle' })) };
 }
 const files = {
   '/': ['public/index.html', 'text/html; charset=utf-8'],
@@ -42,10 +42,21 @@ const server = http.createServer(async (req, res) => {
   }
   if (url.pathname === '/api/embed-origins') return reply(200, [`http://127.0.0.1:${server.address().port}`]);
   if (fixture.offline) return reply(503, { error: 'Synthetic offline check' });
-  if (url.pathname === '/api/state') return reply(200, { lanes: ['codex', 'grok', 'shell'], sessions: fixture.sessions, projectsRoot: '/example', uploadMaxMB: 2, transcribe: true });
+  if (url.pathname === '/api/state') return reply(200, { lanes: ['claude', 'codex', 'grok', 'agy', 'shell'], sessions: fixture.sessions, projectsRoot: '/example', uploadMaxMB: 2, transcribe: true });
   if (url.pathname === '/api/transcribe') { for await (const _chunk of req) {} fixture.transcribePending = () => reply(200, { text: 'dictated for alpha' }); return; }
   if (url.pathname === '/api/projects') return fixture.projectError ? reply(503, { error: 'Project list unavailable' }) : reply(200, [{ path: '/example/alpha', label: 'Alpha project' }, { path: '/example/beta', label: 'Beta project' }, { path: '/example/long', label: 'Example-' + 'architecture'.repeat(12) }]);
-  if (url.pathname === '/api/sessions' && req.method === 'POST') return reply(200, { name: names[0] });
+  if (url.pathname === '/api/sessions' && req.method === 'POST') {
+    let body = ''; for await (const chunk of req) body += chunk;
+    const request = JSON.parse(body); fixture.creates.push(request);
+    const finish = () => {
+      if (fixture.createError) return reply(503, { error: 'Synthetic internal stack: private launch details' });
+      const name = `${request.lane}-example-created-${fixture.creates.length}`;
+      fixture.sessions.push({ name, lane: request.lane, project: request.project, created: Date.now(), status: 'idle' });
+      reply(200, { name });
+    };
+    if (fixture.holdCreate) fixture.createPending = finish; else finish();
+    return;
+  }
   const match = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(history|keys|end|size|upload)$/);
   if (!match) return reply(404, { error: 'Not found' });
   const [, name, action] = match;
@@ -102,6 +113,9 @@ async function run(engineName, engine) {
     const frame = page.frameLocator('iframe');
     const sessions = frame.locator('#sessions');
     await sessions.getByRole('button').first().waitFor();
+    assert.match(await sessions.innerText(), /Codex/);
+    assert.match(await sessions.innerText(), /Grok/);
+    assert.doesNotMatch(await sessions.innerText(), /1234|5678/, 'session suffixes stay out of the visible rows');
     await frame.locator('#session-search').fill('no matching project');
     assert.equal(await sessions.getByRole('button').count(), 0);
     assert.ok((await frame.locator('#list-state').innerText()).length > 0);
@@ -221,19 +235,103 @@ async function run(engineName, engine) {
     await page.screenshot({ path: path.join(artifacts, `${engineName}-session.png`) });
     await frame.locator('[data-go="list"]:visible').click();
     await page.screenshot({ path: path.join(artifacts, `${engineName}-sessions.png`) });
+    // Drive the real setup UI and inspect the wire payloads, including recovery and navigation.
     await frame.locator('#new-btn').click();
-    await frame.locator('#lanes').getByRole('button', { name: /codex/i }).click();
-    await frame.locator('#projects').getByRole('button', { name: /Alpha project/i }).click();
-    assert.equal(await frame.locator('#start-btn').isEnabled(), true);
-    await page.screenshot({ path: path.join(artifacts, `${engineName}-new.png`) });
-    const pickerBox = await frame.locator('#projects').evaluate(el => ({width:el.clientWidth,scrollWidth:el.scrollWidth}));
-    assert.ok(pickerBox.scrollWidth <= pickerBox.width, JSON.stringify(pickerBox));
+    assert.equal(await frame.locator('#new-view').evaluate(() => ['INPUT','TEXTAREA'].includes(document.activeElement.tagName)), false, 'entry does not force the keyboard');
+    assert.deepEqual(await frame.locator('#lanes button').allTextContents(), ['Grok', 'Gemini / Antigravity']);
+    assert.equal(await frame.locator('#other-lanes').isVisible(), false);
+    await frame.locator('#more-assistants summary').click();
+    for (const label of ['Claude', 'Codex', 'Terminal']) assert.equal(await frame.locator('#other-lanes').getByRole('button', {name:label,exact:true}).isVisible(), true);
+    await frame.locator('#more-assistants summary').click();
+    const grok = frame.locator('#lanes').getByRole('button', { name: 'Grok', exact:true });
+    const gemini = frame.locator('#lanes').getByRole('button', { name: 'Gemini / Antigravity', exact:true });
+    await grok.focus(); await grok.press('Enter');
+    assert.equal(await grok.evaluate(el => document.activeElement === el), true, 'selection retains focus');
+    await frame.locator('#projects').getByRole('button', { name: 'Alpha project', exact:true }).click();
+    await frame.locator('#prompt').fill('Please help with the alpha project.');
+    await frame.locator('#project-filter').fill('architecture');
+    assert.match(await frame.locator('#selected-project').innerText(), /Alpha project/);
+    assert.equal(await frame.locator('#start-btn').isEnabled(), true, 'filtering does not clear the selected project');
+    for (const width of [320, 390, 430]) {
+      await page.setViewportSize({width, height:844});
+      const bounds = await frame.locator('#new-view').evaluate(view => ({
+        overflow: view.scrollWidth > innerWidth,
+        pickerOverflow: document.querySelector('#projects').scrollWidth > document.querySelector('#projects').clientWidth,
+        hits: [...view.querySelectorAll('button, summary, input')].filter(el=>el.getBoundingClientRect().height>0).map(el=>({label:el.textContent||el.id,width:el.getBoundingClientRect().width,height:el.getBoundingClientRect().height}))
+      }));
+      assert.equal(bounds.overflow, false); assert.equal(bounds.pickerOverflow, false);
+      for (const hit of bounds.hits) assert.ok(hit.width >=44 && hit.height >=44, JSON.stringify(hit));
+    }
+    await page.setViewportSize({width:390, height:844});
+    await page.screenshot({ path: path.join(artifacts, `${engineName}-new-long-project.png`) });
+    await frame.locator('[data-go="list"]:visible').click();
+    await frame.locator('#new-btn').click();
+    await waitUntil(async()=>await frame.locator('#start-btn').isEnabled(), 'retained project loaded');
+    assert.equal(await frame.locator('#prompt').inputValue(), 'Please help with the alpha project.');
+    assert.equal(await grok.getAttribute('aria-pressed'), 'true');
+    assert.equal(await frame.locator('#project-filter').inputValue(), 'architecture');
+    assert.equal(fixture.creates.length,0,'navigation never sends a draft');
+    fixture.createError = true;
+    await frame.locator('#start-btn').click();
+    await frame.locator('#new-err').filter({hasText:'Start wasn’t confirmed'}).waitFor();
+    assert.deepEqual(fixture.creates.at(-1), {lane:'grok',project:'/example/alpha',prompt:'Please help with the alpha project.'});
+    assert.equal(await frame.locator('#prompt').inputValue(), 'Please help with the alpha project.');
+    assert.match(await frame.locator('#selected-project').innerText(), /Alpha project/);
+    assert.equal(await grok.getAttribute('aria-pressed'), 'true');
+    assert.doesNotMatch(await frame.locator('#new-err').innerText(), /stack|private launch/);
+    await page.screenshot({ path: path.join(artifacts, `${engineName}-new-recovery.png`) });
+    // A failed refetch retains choices, and an inline retry recovers without leaving setup.
+    fixture.projectError = true;
+    await frame.locator('[data-go="list"]:visible').click(); await frame.locator('#new-btn').click();
+    await frame.locator('#retry-projects').waitFor();
+    assert.equal(await frame.locator('#start-btn').isEnabled(),false);
+    assert.match(await frame.locator('#selected-project').innerText(),/Alpha project/);
+    fixture.projectError = false;
+    await frame.locator('#retry-projects').click();
+    await waitUntil(async()=>await frame.locator('#start-btn').isEnabled(),'project retry');
+    assert.equal(await frame.locator('#prompt').inputValue(), 'Please help with the alpha project.');
+    await frame.locator('#project-filter').fill('');
     await frame.locator('#prompt').fill('x'.repeat(8001));
     await frame.locator('#start-btn').click();
     await frame.locator('#new-err').filter({hasText:'too long'}).waitFor();
+    assert.equal(fixture.creates.length,1,'oversized prompt never creates');
     assert.equal((await frame.locator('#prompt').inputValue()).length,8001);
-    await frame.locator('#prompt').fill('');
+    await frame.locator('#prompt').fill('A Grok task');
+    fixture.createError = false;
     await frame.locator('#start-btn').click(); await frame.locator('#term-view').waitFor({state:'visible'});
+    assert.deepEqual(fixture.creates.at(-1), {lane:'grok',project:'/example/alpha',prompt:'A Grok task'});
+    assert.equal(await frame.locator('#t-context').innerText(), 'Grok');
+    await frame.locator('[data-go="list"]:visible').click(); await frame.locator('#new-btn').click();
+    await gemini.click();
+    await waitUntil(async()=>await frame.locator('#start-btn').isEnabled(),'Gemini ready');
+    assert.equal(await frame.locator('#start-btn').innerText(),'Open Gemini / Antigravity');
+    await frame.locator('#prompt').fill('A Gemini task');
+    await page.screenshot({ path: path.join(artifacts, `${engineName}-new.png`) });
+    await frame.locator('#start-btn').click(); await frame.locator('#term-view').waitFor({state:'visible'});
+    assert.deepEqual(fixture.creates.at(-1), {lane:'agy',project:'/example/alpha',prompt:'A Gemini task'});
+    assert.equal(await frame.locator('#t-context').innerText(),'Gemini / Antigravity');
+    // Shell launch is intentionally prompt-free and does not erase an assistant draft.
+    await frame.locator('[data-go="list"]:visible').click(); await frame.locator('#new-btn').click();
+    await frame.locator('#prompt').fill('Keep this assistant draft');
+    await frame.locator('#more-assistants summary').click();
+    await frame.locator('#other-lanes').getByRole('button',{name:'Terminal',exact:true}).click();
+    assert.equal(await frame.locator('#prompt').isDisabled(),true);
+    assert.match(await frame.locator('#prompt-help').innerText(),/without sending/);
+    await waitUntil(async()=>await frame.locator('#start-btn').isEnabled(),'Terminal ready');
+    fixture.holdCreate = true;
+    await frame.locator('#start-btn').click();
+    await waitUntil(()=>fixture.createPending,'pending terminal launch');
+    assert.match(await frame.locator('#start-state').innerText(),/on your Mac/);
+    await frame.locator('[data-go="list"]:visible').click();
+    fixture.createPending(); fixture.holdCreate = false;
+    await waitUntil(()=>fixture.sessions.some(s=>s.lane==='shell'),'terminal created');
+    await pause(150);
+    assert.equal(await frame.locator('#list-view').isVisible(),true,'late start does not hijack navigation');
+    assert.deepEqual(fixture.creates.at(-1),{lane:'shell',project:'/example/alpha',prompt:''});
+    await frame.locator('#new-btn').click(); await grok.click();
+    assert.equal(await frame.locator('#prompt').inputValue(),'Keep this assistant draft');
+    assert.equal(await frame.locator('#prompt').isEnabled(),true);
+    await frame.locator('[data-go="list"]:visible').click(); await alpha().click();
     const sendsBeforeLengthCheck = fixture.sent.length;
     await frame.locator('#input').fill('x'.repeat(20001));
     await frame.locator('#send-btn').click();
@@ -366,6 +464,15 @@ async function run(engineName, engine) {
     for (const hit of hitBounds) assert.ok(hit.width >=44 && hit.height>=44, JSON.stringify(hit));
     console.log(engineName, 'short-frame primary hit targets:', JSON.stringify(hitBounds));
     await page.screenshot({ path: path.join(artifacts, `${engineName}-short-frame.png`) });
+    await frame.locator('[data-go="list"]:visible').click();
+    fixture.sessions = [];
+    await frame.locator('#session-search').fill('');
+    await frame.locator('#sessions').evaluate(() => refresh());
+    await frame.locator('#empty').waitFor();
+    assert.match(await frame.locator('#empty').innerText(), /keep running when you leave/);
+    await page.screenshot({path:path.join(artifacts,`${engineName}-empty.png`)});
+    await frame.locator('#empty-new-btn').click();
+    assert.equal(await frame.locator('#new-view').isVisible(),true);
     assert.deepEqual(errors, []);
     console.log(`${engineName}: keyboard/focus, drafts, delayed upload/timeout recovery, failed send/end, scroll, live reconnect/session isolation, responsive layouts, crowded short frame and new-session flow PASS`);
   } finally { await browser.close(); }

@@ -73,7 +73,8 @@ async function freePort() {
         const page=await context.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));
         await page.goto(base);
         await page.locator('#new-btn').click();
-        await page.locator('#lanes').getByRole('button',{name:'shell',exact:true}).click();
+        await page.locator('#more-assistants summary').click();
+        await page.locator('#other-lanes').getByRole('button',{name:'Terminal',exact:true}).click();
         await page.locator('#projects').getByRole('button',{name:'example',exact:true}).click();
         await page.locator('#start-btn').click();
         await page.locator('#reader').filter({hasText:'DELIVERY FIXTURE READY'}).waitFor();

@@ -4,3 +4,7 @@ node_modules/
 state/
 .DS_Store
 cockpit.config.json
+
+# Local review/build artifacts and isolated task checkouts
+build/
+.worktrees/
