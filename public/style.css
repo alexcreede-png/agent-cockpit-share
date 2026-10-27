@@ -72,7 +72,10 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 .form { flex: 1; min-height: 0; overflow-y: auto; padding: 0 16px 24px; }
 .launch-footer { flex: none; max-height: 60%; overflow-y: auto; padding: 10px 16px 12px; background: var(--bg); border-top: 1px solid var(--line); }
 .launch-footer #start-state, .launch-footer #new-err { margin: 0 0 10px; }
-.startup-note { flex: none; margin: 8px 14px; color: var(--muted); }
+.startup-note { flex: none; display: flex; align-items: center; gap: 8px; margin: 0 12px; }
+.startup-note .field-help { flex: 1; min-width: 0; margin: 8px 0; }
+.startup-note button { flex: none; padding-inline: 8px; }
+.keys-help { flex: 0 0 100%; order: -1; margin: 0 0 4px; color: var(--muted); font: 12px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
 .pending-list { margin: 0 16px 12px; }
 #pending-info { margin: 14px 4px; }
 #different-confirm { border-top: 1px solid var(--line); margin-bottom: 10px; }

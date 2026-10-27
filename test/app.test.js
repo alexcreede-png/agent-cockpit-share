@@ -12,7 +12,7 @@ test('public/app.js compiles as a script', () => {
   assert.doesNotThrow(() => new vm.Script(src, { filename: 'app.js' }));
 });
 
-function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, history = '', historyError = false, createFlow = false, startRecovery = false, savedStarts = new Map(), storageDenied = false, cryptoDenied = false } = {}) {
+function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, history = '', terminalHistory, historyError = false, createFlow = false, startRecovery = false, savedStarts = new Map(), storageDenied = false, cryptoDenied = false } = {}) {
   class Element {
     constructor() {
       this.children = []; this.dataset = {}; this.style = {}; this.value = ''; this.hidden = false;
@@ -28,10 +28,19 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
         },
       };
     }
+    get textContent() { return this._text || this.children.map(n => n.textContent).join(''); }
+    set textContent(value) { this._text = value; this.children = []; }
     get firstElementChild() { return this.children[0]; }
-    replaceChildren(...nodes) { this.children = nodes; }
-    append(...nodes) { this.children.push(...nodes); }
-    remove() {}
+    appendChild(node) { this.append(node); return node; }
+    querySelectorAll(selector) {
+      const classes = selector.split('.').filter(Boolean);
+      return this.children.flatMap(n => [n, ...n.querySelectorAll(selector)])
+        .filter(n => classes.every(c => n.classList.contains(c)));
+    }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+    replaceChildren(...nodes) { this._text = ''; this.children = []; this.append(...nodes); }
+    append(...nodes) { for (const n of nodes) { n.parent = this; this.children.push(n); } }
+    remove() { if (this.parent) this.parent.children = this.parent.children.filter(n => n !== this); }
     setAttribute(k, v) { this[k] = v; }
     addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
     fire(type, event = {}) { for (const fn of this.listeners[type] || []) fn(event); }
@@ -104,6 +113,7 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
     setInterval: () => 1, clearInterval() {},
     addEventListener() {}, innerHeight: 800, fetch: async (path, opts = {}) => {
       calls.push({ path, opts });
+      const responseHistory = !path.includes('format=reader') && terminalHistory !== undefined ? terminalHistory : historyText;
       if (voiceStall && path === '/api/transcribe') return new Promise((resolve, reject) => {
         opts.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
       });
@@ -122,9 +132,9 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
         : path === '/api/projects' ? exampleProjects : path === '/api/sessions' ? {name:'synthetic-created', ...(setup.badReply ? {} : {requestId: JSON.parse(opts.body).requestId}), reused: false} : {};
       const failed = (setup.projectError && path === '/api/projects') || ((setup.createError || setup.errorCode) && path === '/api/sessions') || (failHistory && path.includes('/history')) || (failSend && path === '/api/sessions/a/keys') || (failEnd && path === '/api/sessions/a/end');
       return { ok: !failed, status: failed ? (path === '/api/sessions' && (setup.errorCode || setup.createError) ? setup.errorStatus : failSendStatus) : 200,
-        headers: { get: () => path.includes('/history') ? 'text/plain' : 'application/json' },
-        json: async () => failed ? { error: 'unavailable', code: setup.errorCode, requestId: path === '/api/sessions' ? JSON.parse(opts.body).requestId : undefined, name: 'synthetic-created' } : body,
-        text: async () => path.includes('/history') ? historyText : '' };
+        headers: { get: () => path.includes('/history') && typeof responseHistory === 'string' ? 'text/plain' : 'application/json' },
+        json: async () => path.includes('/history') && !failed ? responseHistory : failed ? { error: 'unavailable', code: setup.errorCode, requestId: path === '/api/sessions' ? JSON.parse(opts.body).requestId : undefined, name: 'synthetic-created' } : body,
+        text: async () => path.includes('/history') ? responseHistory : '' };
     },
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8'), context);
@@ -621,7 +631,7 @@ test('response loss checks the same immutable request, with no duplicate automat
   assert.equal(startCalls(h)[1].opts.body,startCalls(h)[0].opts.body,'wire body is unchanged');
   assert.equal(h.savedStarts.size,0);
   assert.equal(h.el('#prompt').value,'Changed task','confirmation cannot clear a newer draft');
-  assert.match(h.el('#start-state').textContent,/Terminal created.*setup or sign-in/);
+  assert.equal(h.el('#start-state').textContent,'Task opened.');
 });
 
 test('reload restores pending choices and draft without sending; explicit check uses original ID', async () => {
@@ -812,7 +822,7 @@ test('pending Terminal reload keeps the assistant draft while always checking an
   assert.equal(restored.el('#prompt').value,'Retained assistant message');
   assert.equal(restored.el('#prompt').disabled,true);
   await restored.el('#start-btn').click(); assert.deepEqual(startBody(restored),original);
-  assert.match(restored.el('#startup-note').textContent,/doesn’t confirm.*accepted/);
+  assert.equal(restored.el('#startup-note').hidden,true,'shell tasks do not need assistant startup help');
   restored.el('#new-btn').click(); await tick();
   restored.el('#lanes').children.find(b=>b.dataset.lane==='grok').click();
   assert.equal(restored.el('#prompt').value,'Retained assistant message');
@@ -828,4 +838,169 @@ test('Grok startup Read removes centering only and preserves the complete warnin
   assert.equal(readable, screen.split('\n').map(line => line.trimStart()).join('\n'));
   assert.equal(vm.runInContext("compactReadHistory(startupScreen, 'agy')", h.context), screen);
   assert.equal(vm.runInContext("compactReadHistory('    example code', 'grok')", h.context), '    example code');
+});
+
+
+const ownedConversation = messages => ({ source: 'conversation', messages });
+const shownMessages = [
+  { id: 'u1', role: 'user', text: 'A synthetic first message' },
+  { id: 'a1', role: 'assistant', text: 'A synthetic reply' },
+];
+const openNewAssistant = h => vm.runInContext("refresh = async () => {}; openTerm('a', {name:'a',lane:'grok',status:'idle'}, true)", h.context);
+
+test('generic startup help is dismissible per task and terminal replies never establish acceptance', async () => {
+  const h = frontend({history: 'Assistant: Ready. First message accepted.'});
+  await tick(); openNewAssistant(h); await tick();
+  assert.equal(h.el('#startup-note').hidden,false);
+  assert.equal(h.el('#output-source').textContent,'Terminal output');
+  assert.equal(h.el('#reader').textContent,'Assistant: Ready. First message accepted.');
+  assert.equal(h.el('#reader').children.length,0,'terminal text is never fabricated into chat messages');
+  assert.equal(h.el('#answer-start').hidden,true);
+  assert.equal(h.el('#reader-tools').hidden,true,'fallback labeling adds no reader toolbar');
+  assert.equal(h.el('#dismiss-startup').hidden,false);
+  h.el('#dismiss-startup').click();
+  assert.equal(h.el('#startup-note').hidden,true);
+  vm.runInContext("openTerm('b', {name:'b',lane:'agy',status:'idle'}, true)",h.context); await tick();
+  assert.equal(h.el('#startup-note').hidden,false,'a separate task owns separate help');
+  openNewAssistant(h); await tick();
+  assert.equal(h.el('#startup-note').hidden,true,'reopening cannot undo dismissal');
+});
+
+test('owned displayed messages remove generic help without changing status, drafts or delivery feedback', async () => {
+  for (const messages of [shownMessages.slice(0,1),shownMessages.slice(1),shownMessages]) {
+    const h=frontend({history:ownedConversation(messages)}); await tick(); openNewAssistant(h);
+    h.el('#input').value='A later unsent message'; h.el('#input').oninput();
+    vm.runInContext("sessionDelivery('a', 'Delivery unconfirmed. Check output before retrying.', true)",h.context);
+    await tick();
+    assert.equal(h.el('#startup-note').hidden,true);
+    assert.equal(h.el('#output-source').textContent,'Conversation');
+    assert.equal(h.el('#reader')['aria-label'],'Conversation');
+    assert.equal(h.el('#reader').querySelectorAll('.message').length,messages.length);
+    assert.equal(h.el('#t-status').textContent,'Idle','displayed messages never establish readiness');
+    assert.equal(h.el('#input').value,'A later unsent message');
+    assert.match(h.el('#delivery').textContent,/Delivery unconfirmed/);
+    assert.equal(h.el('#answer-start').hidden,!messages.some(m=>m.role==='assistant'));
+    h.setHistory('A later terminal setup question?'); await vm.runInContext('pullReader()',h.context);
+    assert.equal(h.el('#output-source').textContent,'Terminal output');
+    assert.equal(h.el('#reader').textContent,'A later terminal setup question?');
+    assert.equal(h.el('#reader').children.length,0);
+    assert.equal(h.el('#answer-start').hidden,true);
+    assert.equal(h.el('#startup-note').hidden,true,'known displayed history does not need generic startup help again');
+  }
+});
+
+test('empty conversation and a successful send keep generic help; no acknowledgement proves message acceptance', async () => {
+  const h=frontend({history:ownedConversation([])}); await tick(); openNewAssistant(h); await tick();
+  assert.equal(h.el('#startup-note').hidden,false);
+  h.el('#input').value='Synthetic message'; h.el('#input').oninput();
+  const sending=h.el('#input-row').onsubmit({preventDefault(){}}); await tick(); h.finishSend(); await sending;
+  assert.equal(h.el('#startup-note').hidden,false);
+  assert.equal(h.el('#t-status').textContent,'Idle');
+  assert.equal(h.el('#reader').querySelectorAll('.message').length,0);
+  assert.equal(h.el('#delivery').textContent,'Sent to terminal');
+});
+
+test('Needs you preserves the raw setup question and opens Respond controls only on explicit action', async () => {
+  const question='Do you trust the contents of this project?\n> Yes, I trust this folder\n  No, exit\n↑/↓ Navigate · enter Confirm';
+  const h=frontend({history:question}); await tick(); openNewAssistant(h); await tick();
+  h.el('#dismiss-startup').click();
+  const before=h.calls.filter(c=>c.path.endsWith('/keys')).length;
+  vm.runInContext("renderTermIdentity({name:'a',lane:'agy',status:'needs-you'})",h.context);
+  assert.equal(h.el('#startup-note').hidden,false,'generic dismissal cannot suppress attention guidance');
+  assert.equal(h.el('#dismiss-startup').hidden,true);
+  assert.equal(h.el('#startup-respond').hidden,false);
+  assert.match(h.el('#startup-help').textContent,/Review.*question.*Respond/);
+  assert.equal(h.el('#keys-toggle').textContent,'Respond');
+  assert.equal(h.el('#reader').textContent,question);
+  assert.equal(h.el('#keys').classList.contains('short-open'),false);
+  h.el('#startup-respond').click();
+  assert.equal(h.el('#keys').classList.contains('short-open'),true);
+  assert.equal(h.el('#keys-toggle')['aria-expanded'],'true');
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length,before,'opening Respond never answers a question');
+  assert.equal(h.el('#reader').textContent,question);
+  vm.runInContext("renderTermIdentity({name:'a',lane:'agy',status:'working'})",h.context);
+  assert.equal(h.el('#startup-note').hidden,true);
+  assert.equal(h.el('#keys-toggle').textContent,'Controls');
+});
+
+test('output labels follow Read/Live and selected-task guards ignore old source responses', async () => {
+  const h=frontend({history:ownedConversation(shownMessages)}); await tick(); openNewAssistant(h); await tick();
+  assert.equal(h.el('#output-source').textContent,'Conversation');
+  vm.runInContext("setMode('live')",h.context);
+  assert.equal(h.el('#output-source').textContent,'Live terminal');
+  assert.equal(h.el('#answer-start').hidden,true);
+  const fetch=h.context.fetch;
+  let finishHistory;
+  h.context.fetch=async (path,opts)=>path.includes('/history') ? new Promise(resolve=>{finishHistory=resolve;}) : fetch(path,opts);
+  vm.runInContext("setMode('read')",h.context); await tick();
+  assert.equal(h.el('#output-source').textContent,'Loading output…');
+  const finishA=finishHistory;
+  vm.runInContext("openTerm('b', {name:'b',lane:'agy',status:'needs-you'})",h.context); await tick();
+  // Capture b's completion separately; an old a response must not relabel this task.
+  const finishB=finishHistory;
+  finishB({ok:true,headers:{get:()=> 'text/plain'},text:async()=> 'A setup question for b'}); await tick();
+  assert.equal(h.el('#output-source').textContent,'Terminal output');
+  assert.equal(h.el('#startup-note').hidden,false);
+  finishA({ok:true,headers:{get:()=> 'application/json'},json:async()=> ownedConversation(shownMessages)}); await tick();
+  assert.equal(h.el('#output-source').textContent,'Terminal output');
+  assert.equal(h.el('#reader').textContent,'A setup question for b');
+  assert.equal(h.el('#startup-note').hidden,false);
+});
+
+
+test('Respond navigation stays open; Enter closes only after success and failed keys remain retryable', async () => {
+  for (const failSend of [false,true]) {
+    const h=frontend({failSend,history:'A setup question'}); await tick(); openNewAssistant(h); await tick();
+    vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'needs-you'})",h.context);
+    h.el('#startup-respond').click();
+    const up=h.el('#keys').children.find(b=>b.textContent==='↑');
+    const navigation=up.click(); await tick(); h.finishSend(); await navigation;
+    assert.equal(h.el('#keys').classList.contains('short-open'),true);
+    const enter=h.el('#keys').children.find(b=>b.textContent==='Enter');
+    const confirmation=enter.click(); await tick();
+    assert.equal(h.el('#keys').classList.contains('short-open'),true,'waits for acknowledged key delivery');
+    h.finishSend(); await confirmation;
+    assert.equal(h.el('#keys').classList.contains('short-open'),failSend);
+    assert.equal(enter.disabled,false);
+    if (!failSend) assert.equal(h.context.document.activeElement,h.el('#startup-respond'),'focus returns to the Respond button that opened controls');
+    const sent=h.calls.filter(c=>c.path.endsWith('/keys')).map(c=>JSON.parse(c.opts.body));
+    assert.deepEqual(sent,[{key:'Up'},{key:'Enter'}],'only explicitly chosen response keys are sent');
+  }
+});
+
+
+test('Needs you shows the current raw question even when an owned conversation already exists', async () => {
+  const question='Do you trust the contents of this project?\n> Yes, I trust this folder\n  No, exit';
+  const h=frontend({history:ownedConversation(shownMessages),terminalHistory:question});
+  await tick(); openNewAssistant(h); await tick();
+  assert.equal(h.el('#startup-note').hidden,true);
+  assert.equal(h.el('#output-source').textContent,'Conversation');
+  vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'needs-you'})",h.context);
+  await vm.runInContext('pullReader()',h.context);
+  assert.equal(h.el('#reader').textContent,question);
+  assert.equal(h.el('#output-source').textContent,'Terminal output');
+  assert.equal(h.el('#answer-start').hidden,true);
+  assert.equal(h.el('#startup-note').hidden,false);
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length,0);
+  vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'working'})",h.context);
+  await vm.runInContext('pullReader()',h.context);
+  assert.equal(h.el('#output-source').textContent,'Conversation');
+  assert.equal(h.el('#reader').querySelectorAll('.message').length,2);
+  assert.equal(h.el('#startup-note').hidden,true);
+});
+
+test('a conversation response from before Needs you cannot replace the current question', async () => {
+  const question='Choose a setup option';
+  const h=frontend({history:'Earlier output',terminalHistory:question}); await tick(); openNewAssistant(h); await tick();
+  const fetch=h.context.fetch;
+  let finishOld;
+  h.context.fetch=async (path,opts)=>path.includes('format=reader') ? new Promise(resolve=>{finishOld=resolve;}) : fetch(path,opts);
+  const oldPull=vm.runInContext('pullReader()',h.context); await tick();
+  vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'needs-you'})",h.context);
+  finishOld({ok:true,headers:{get:()=> 'application/json'},json:async()=> ownedConversation(shownMessages)}); await oldPull;
+  assert.equal(h.el('#reader').textContent,'Earlier output');
+  await vm.runInContext('pullReader()',h.context);
+  assert.equal(h.el('#reader').textContent,question);
+  assert.equal(h.el('#output-source').textContent,'Terminal output');
+  assert.equal(h.el('#startup-note').hidden,false);
 });

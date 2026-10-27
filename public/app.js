@@ -113,7 +113,9 @@ function renderTermIdentity(s, name = current) {
   const pill = $('#t-status');
   pill.className = 'pill ' + (s ? s.status : 'idle');
   pill.textContent = s ? STATUS_LABEL[s.status] || s.status : 'starting';
-  $('#keys-toggle').textContent = s?.status === 'needs-you' ? 'Respond' : 'Controls';
+  needsResponse = s?.status === 'needs-you';
+  $('#keys-toggle').textContent = needsResponse ? 'Respond' : 'Controls';
+  renderStartupHelp();
 }
 
 function renderList() {
@@ -431,7 +433,7 @@ $('#start-btn').onclick = async () => {
     const sameDraft = draftRevision === attempt.revision && pick.lane === request.lane && pick.project === request.project
       && $('#prompt').value === request.prompt;
     if (request.lane !== 'shell' && sameDraft && viewEpoch === attempt.epoch) $('#prompt').value = '';
-    $('#start-state').textContent = 'Terminal created. The assistant may still need setup or sign-in; check its output before sending again.';
+    $('#start-state').textContent = 'Task opened.';
     recoveryNotice = '';
     await refresh();
     // Navigation and an intentionally newer request take priority over a late response.
@@ -468,6 +470,34 @@ let mode = store.get('cockpit-mode') || ((framed || touch) ? 'read' : 'live');
 let readerEpoch = 0, readerBusy = false;
 let readTimer = null, lastText = null, lastSize = '', wsRetry = 0, wsTimer = null;
 let liveEpoch = 0;
+let needsResponse = false, outputSource = null;
+// Page-only help state belongs to the task, never to a delivery acknowledgement.
+const startupHelp = new Map();
+function renderStartupHelp() {
+  const help = startupHelp.get(current);
+  const generic = !!help && !help.dismissed && !help.hasMessages;
+  $('#startup-note').hidden = !needsResponse && !generic;
+  $('#startup-help').textContent = needsResponse
+    ? 'Review the assistant’s question, then choose Respond.'
+    : 'Review any setup questions before sending a message.';
+  $('#startup-respond').hidden = !needsResponse;
+  $('#dismiss-startup').hidden = needsResponse || !generic;
+}
+$('#dismiss-startup').onclick = () => {
+  const help = startupHelp.get(current);
+  if (help) help.dismissed = true;
+  renderStartupHelp();
+  $('#mode-btn').focus({ preventScroll: true });
+};
+function labelOutput(source) {
+  outputSource = source;
+  const label = source === 'conversation' ? 'Conversation' : source === 'terminal' ? 'Terminal output'
+    : source === 'live' ? 'Live terminal' : 'Loading output…';
+  $('#output-source').textContent = label;
+  $('#output-source').hidden = source === 'conversation'; // The Conversation toolbar already labels this source.
+  $('#reader-tools').hidden = source !== 'conversation';
+  $('#reader').setAttribute('aria-label', source === 'conversation' ? 'Conversation' : 'Terminal output');
+}
 // Session names come from the server. Composer data remains in memory for this page only.
 const composers = new Map();
 const composer = (name) => {
@@ -477,9 +507,9 @@ const composer = (name) => {
 const activeComposer = () => current ? composer(current) : null;
 
 function openTerm(name, session = state.sessions.find((s) => s.name === name), justCreated = false) {
-  $('#startup-note').textContent = justCreated
-    ? 'Terminal created. Check the output for setup or sign-in. This doesn’t confirm your first message was accepted.' : '';
-  $('#startup-note').hidden = !justCreated;
+  if (justCreated && session?.lane !== 'shell' && !startupHelp.has(name)) {
+    startupHelp.set(name, { dismissed: false, hasMessages: false });
+  }
   closeTerm();
   show('term');
   current = name;
@@ -514,7 +544,8 @@ function setMode(m) {
   $('#mode-btn').setAttribute('aria-label', m === 'read' ? 'Switch to live terminal' : 'Switch to readable output');
   $('#reader').hidden = m !== 'read';
   $('#answer-start').hidden = true;
-  $('#reader-tools').hidden = true;
+  labelOutput(m === 'live' ? 'live' : null);
+  renderStartupHelp();
   $('#term').hidden = m !== 'live';
   $('#to-bottom').hidden = true;
   if (m === 'read') { stopLive(); startReader(); } else { stopReader(); startLive(); }
@@ -623,11 +654,13 @@ function readerState(text, busy = false) {
 }
 async function pullReader() {
   if (!current || mode !== 'read' || readerBusy) return;
-  const name = current, epoch = readerEpoch;
+  const name = current, epoch = readerEpoch, reviewQuestion = needsResponse;
   readerBusy = true;
   let text;
   try {
-    text = await api(`/api/sessions/${name}/history?lines=3000&format=reader`);
+    // Setup/approval questions and their choices live in the terminal, even when
+    // an owned saved conversation exists. Never replace that question with old chat.
+    text = await api(`/api/sessions/${name}/history?lines=3000${reviewQuestion ? '' : '&format=reader'}`);
     if (name === current && epoch === readerEpoch) { note(''); connection('connected'); }
   } catch {
     if (name === current && epoch === readerEpoch) {
@@ -637,14 +670,24 @@ async function pullReader() {
     }
     return;
   } finally { if (epoch === readerEpoch) readerBusy = false; }
-  if (name !== current || mode !== 'read' || epoch !== readerEpoch) return;
+  if (name !== current || mode !== 'read' || epoch !== readerEpoch || reviewQuestion !== needsResponse) return;
   const conversation = text && typeof text === 'object' && text.source === 'conversation' && Array.isArray(text.messages) ? text : null;
   const messages = conversation ? conversation.messages : null;
+  const source = conversation ? 'conversation' : 'terminal';
+  const sourceChanged = outputSource !== source;
+  labelOutput(source);
+  // The owned conversation proves these displayed messages exist. It says nothing
+  // about a later pending send, and never changes task status or delivery feedback.
+  if (messages?.some(m => m.role === 'user' || m.role === 'assistant')) {
+    const help = startupHelp.get(name);
+    if (help) help.hasMessages = true;
+    renderStartupHelp();
+  }
   text = conversation ? JSON.stringify(messages) : compactReadHistory(typeof text === 'string' ? text : '', state.sessions.find(s => s.name === name)?.lane);
   readerState(text ? 'Output available.' : 'No output yet.');
   const el = $('#reader'), resized = el.clientHeight !== readerHeight;
   readerHeight = el.clientHeight;
-  if (text === lastText) {
+  if (text === lastText && !sourceChanged) {
     if (resized && readerFollow) el.scrollTop = el.scrollHeight;
     return;
   }
@@ -662,7 +705,6 @@ async function pullReader() {
   } else {
     el.classList.remove('conversation');
     $('#answer-start').hidden = true;
-    $('#reader-tools').hidden = true;
     el.textContent = text || 'No output yet.';
     if (stick) el.scrollTop = el.scrollHeight;
     readerFollow = stick;
@@ -676,7 +718,7 @@ function startReader() {
   readerHeight = $('#reader').clientHeight;
   $('#reader').classList.remove('conversation');
   $('#answer-start').hidden = true;
-  $('#reader-tools').hidden = true;
+  labelOutput(null);
   $('#reader').textContent = 'Loading…';
   readerState('Loading task output…', true);
   fitSession();
@@ -831,6 +873,10 @@ $('#keys').replaceChildren(...QUICK_KEYS.map(([label, key], index) => {
   };
   return b;
 }));
+const keysHelp = document.createElement('p');
+keysHelp.className = 'keys-help';
+keysHelp.textContent = 'Follow the question’s keys. Use ↑ / ↓ and Enter for menus.';
+$('#keys').append(keysHelp);
 const moreKeys = document.createElement('button');
 moreKeys.type = 'button'; moreKeys.textContent = 'More keys'; moreKeys.setAttribute('aria-expanded', 'false');
 moreKeys.onclick = () => {
@@ -841,21 +887,35 @@ moreKeys.onclick = () => {
 };
 $('#keys').append(moreKeys);
 const keysToggle = $('#keys-toggle');
+let responseTrigger = null;
 function closeShortKeys(restoreFocus = true) {
   if (!$('#keys').classList.contains('short-open')) return;
   $('#keys').classList.remove('short-open');
   keysToggle.setAttribute('aria-expanded', 'false');
+  $('#startup-respond').setAttribute('aria-expanded', 'false');
   keysToggle.setAttribute('aria-label', 'Show response controls');
-  if (restoreFocus) keysToggle.focus();
+  if (restoreFocus) (responseTrigger ? (responseTrigger.hidden ? $('#mode-btn') : responseTrigger) : keysToggle).focus();
+  responseTrigger = null;
+}
+function openResponseControls(trigger = keysToggle) {
+  if (!current) return;
+  responseTrigger = trigger;
+  $('#keys').classList.add('short-open');
+  keysToggle.setAttribute('aria-expanded', 'true');
+  $('#startup-respond').setAttribute('aria-expanded', 'true');
+  keysToggle.setAttribute('aria-label', 'Hide response controls');
+  $('#keys button').focus();
 }
 keysToggle.onclick = () => {
   if ($('#keys').classList.contains('short-open')) closeShortKeys();
-  else {
-    $('#keys').classList.add('short-open');
-    keysToggle.setAttribute('aria-expanded', 'true');
-    keysToggle.setAttribute('aria-label', 'Hide response controls');
-    $('#keys button').focus();
-  }
+  else openResponseControls();
+};
+$('#startup-respond').onclick = () => openResponseControls($('#startup-respond'));
+$('#keys').onkeydown = (event) => {
+  if (event.key !== 'Escape' || !$('#keys').classList.contains('short-open')) return;
+  event.preventDefault();
+  event.stopPropagation();
+  closeShortKeys();
 };
 
 function delivery(text, error = false) {

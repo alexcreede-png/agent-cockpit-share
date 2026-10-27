@@ -15,7 +15,8 @@ const uploads = require('./lib/uploads');
 const voice = require('./lib/transcribe');
 const config = require('./lib/config').load();
 
-const readConversation = require('./lib/reader').createReader({ grokHome: config.grokHome, paneIdentity: tmux.paneIdentity });
+const readConversation = require('./lib/reader').createReader({ grokHome: config.grokHome, paneIdentity: tmux.paneIdentity,
+  agyHome: config.agyHome, stateDir: config.stateDir, readerIdentity: tmux.readerIdentity });
 
 const PORT = config.port;
 const PUBLIC_HOST = config.publicHost;
@@ -27,7 +28,7 @@ const CFG = {
   allowLocal: config.allowLocal,
 };
 const NOTIFY = config.notify && !!config.notifyCommand;
-tmux.configure({ sessionClosedCommand: config.sessionClosedCommand, uploadsDir: config.uploadsDir });
+tmux.configure({ sessionClosedCommand: config.sessionClosedCommand, uploadsDir: config.uploadsDir, stateDir: config.stateDir });
 const starts = require('./lib/starts').createStarter({ stateDir: config.stateDir, tmux });
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -145,13 +146,17 @@ async function handle(req, res) {
     const s = await requireSession(m[1]);
     if (!s) return send(res, 404, { error: 'no such session' });
     if (req.method === 'GET' && m[2] === 'history') {
+      const lines = Math.min(Math.max(Number(url.searchParams.get('lines')) || 2000, 50), 20000);
+      let screen;
       if (url.searchParams.get('format') === 'reader') {
+        screen = await tmux.capture(s.name, lines);
         let conversation = null;
-        try { if (guard.resolveProject(s.project, config)) conversation = await readConversation(s); } catch { /* Fall back without exposing local paths. */ }
+        try {
+          if (!require('./lib/reader').preferTerminal(screen) && guard.resolveProject(s.project, config)) conversation = await readConversation(s);
+        } catch { /* Fall back without exposing local paths. */ }
         if (conversation) return send(res, 200, conversation);
       }
-      const lines = Math.min(Math.max(Number(url.searchParams.get('lines')) || 2000, 50), 20000);
-      return send(res, 200, await tmux.capture(s.name, lines), 'text/plain; charset=utf-8');
+      return send(res, 200, screen ?? await tmux.capture(s.name, lines), 'text/plain; charset=utf-8');
     }
     if (req.method === 'POST' && m[2] === 'keys') {
       const body = await readJson(req);

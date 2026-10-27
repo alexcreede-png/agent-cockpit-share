@@ -68,7 +68,10 @@ const server = http.createServer(async (req, res) => {
   const match = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(history|keys|end|size|upload)$/);
   if (!match) return reply(404, { error: 'Not found' });
   const [, name, action] = match;
-  if (action === 'history') return fixture.historyError ? reply(503, {error:'Synthetic history failure'}) : reply(200, fixture.history, typeof fixture.history === 'string' ? 'text/plain; charset=utf-8' : 'application/json');
+  if (action === 'history') {
+    const history = url.searchParams.get('format') === 'reader' ? fixture.history : (fixture.terminalHistory || output);
+    return fixture.historyError ? reply(503, {error:'Synthetic history failure'}) : reply(200, history, typeof history === 'string' ? 'text/plain; charset=utf-8' : 'application/json');
+  }
   if (action === 'keys') {
     let body = ''; for await (const chunk of req) body += chunk;
     fixture.sent.push({ name, ...JSON.parse(body) });
@@ -144,7 +147,9 @@ async function recoveryCases(engineName, browser) {
     assert.deepEqual(fixture.creates.at(-1),original);
     assert.equal(fixture.sessions.filter(s=>s.name===fixture.starts.get(original.requestId).name).length,1);
     assert.equal(await page.evaluate(()=>sessionStorage.getItem('cockpit-pending-start-v1')),null);
-    assert.match(await page.locator('#startup-note').innerText(),/doesn’t confirm.*accepted/);
+    assert.match(await page.locator('#startup-note').innerText(),/Review any setup questions/);
+    await page.locator('#dismiss-startup').click();
+    assert.equal(await page.locator('#startup-note').isVisible(), false);
 
     await page.locator('[data-go="list"]:visible').click(); await setup();
     await page.locator('#prompt').fill('A separate task'); fixture.createCode='START_UNCONFIRMED';
@@ -279,6 +284,22 @@ async function run(engineName, engine) {
     await page.screenshot({path:path.join(artifacts,`${engineName}-conversation-start.png`)});
     await frame.locator('#reader').evaluate(el=>el.scrollTop=el.scrollHeight);
     await page.screenshot({path:path.join(artifacts,`${engineName}-conversation-end.png`)});
+    fixture.terminalHistory = 'Allow this task to read the selected project?\n  1. Allow once\n  2. Cancel\nUse arrow keys and Enter to choose.';
+    fixture.sessions[0].status = 'needs-you';
+    await frame.locator('#startup-respond').waitFor({state:'visible'});
+    await frame.locator('#reader').filter({hasText:'Allow this task to read'}).waitFor();
+    assert.equal(await frame.locator('#output-source').innerText(), 'Terminal output');
+    assert.equal(await frame.locator('#reader-tools').isVisible(), false, 'current approval question replaces old conversation');
+    const beforeRespond = fixture.sent.length;
+    await frame.locator('#startup-respond').click();
+    assert.equal(await frame.locator('#keys').isVisible(), true);
+    assert.equal(fixture.sent.length, beforeRespond, 'opening Respond never answers a question');
+    await page.screenshot({path:path.join(artifacts,`${engineName}-needs-response.png`)});
+    await frame.locator('#keys button').first().press('Escape');
+    assert.equal(await frame.locator('#startup-respond').evaluate(el => document.activeElement === el), true);
+    fixture.sessions[0].status = 'idle';
+    await frame.locator('#startup-note').waitFor({state:'hidden'});
+    await frame.locator('#reader.conversation').waitFor();
     fixture.history = output;
     await waitUntil(async()=> !(await frame.locator('#reader').getAttribute('class')||'').includes('conversation'),'terminal fallback');
     await frame.locator('#input').fill('Alpha draft');

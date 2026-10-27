@@ -186,18 +186,55 @@ node scripts/verify-delivery.cjs
 
 This uses a synthetic terminal fixture on a unique tmux server. It verifies actual single-line and multiline submissions, rendered replies, resize/focus behavior, and cleanup without accessing existing sessions. Use the same optional browser executable overrides as the UI suite.
 
+### Startup help and output labels
+
+New assistant tasks show a short setup tip with Dismiss. Needs you shows separate guidance:
+review the assistant's question, then choose Respond to open the keys. Opening Respond sends
+nothing. While a task Needs you, Read shows terminal output so its current question and choices
+remain visible even if a saved conversation exists. Live opens the terminal when needed.
+
+Conversation labels the owned structured user/assistant messages. Terminal output labels the
+terminal fallback; terminal text is never turned into chat messages. Displayed conversation
+messages retire generic startup help, but do not confirm a later pending message, change task
+status, or clear delivery warnings. Terminal output and successful sends do not establish
+assistant readiness or message acceptance. Dismissal lasts for this page and task only.
+
 ### Reading complete Grok answers
 
 Read view uses Grok's saved user/assistant conversation when its active-session registry matches
 both the cockpit pane process and project directory. This shows complete, naturally wrapping
 messages instead of the TUI's clipped viewport. Answer start returns to the latest answer;
-new output preserves your reading position. Phone terminal keys stay behind Keys, and Live
+new output preserves your reading position. Phone response keys stay behind Controls (Respond when a task Needs you), and Live
 remains available for exact terminal interaction.
 
 Only the bound conversation's `updates.jsonl` is read. System prompts, thinking, tool inputs,
 and tool outputs are excluded. No newest-session guess or transcript-directory scan is used.
-Other lanes and unavailable/unsupported Grok histories retain terminal Read view. The adapter
+Unavailable/unsupported Grok histories retain terminal Read view. The adapter
 supports the standard encoded-project directory layout, up to 32 MiB of events and 2 MiB of
 message text; it falls back instead of silently truncating. Bindings survive an agent exit while
 the server remains running, but are rediscovered from active processes after a server restart.
 Set `grokHome` in the local configuration only when Grok uses a nonstandard home directory.
+
+### Reading complete Gemini answers
+
+New Gemini tasks launched through Cockpit can show their complete saved conversation, including
+after a Cockpit server restart. The `agy` bridge preserves interactive input and approvals and
+retains only a new-conversation identity from its diagnostic stream; raw diagnostics are discarded.
+The reader requires the same launch nonce, live wrapper/child processes, project directory,
+conversation identity and creation time before opening that task's saved messages read-only.
+Live identity is checked again before publishing the result. An ambiguous launch disables its
+reader in live process state even if its binding file cannot be updated.
+It never searches for the newest conversation. System instructions, thinking and tool details
+are excluded. Existing tasks launched without this bridge keep terminal output.
+
+This adapter covers the Antigravity 1.4.7 local format and requires Node's built-in SQLite support.
+Unknown formats, unavailable SQLite, ended tasks or failed identity checks fall back to terminal
+output. Explicit current error headings and approval prompts also select terminal output so
+older saved messages cannot conceal a request for attention. This is a bounded presentation
+check; Live remains available for other terminal messages. It accepts at most 10,000 steps, 32 MiB of stored payloads and 2 MiB of visible text;
+larger histories fall back rather than being silently clipped. Set `agyHome` in the local
+configuration only when the CLI stores its data outside `~/.gemini/antigravity-cli`.
+
+To check the bridge without running an AI provider, run `node scripts/verify-agy.cjs`.
+It uses a synthetic CLI on a unique tmux server and verifies that ending its terminal
+reaps both the bridge and child process.

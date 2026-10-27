@@ -61,6 +61,7 @@ function fakeMachine() {
       case 'list-panes': return [...machine.sessions.values()].map((s) =>
         `${s.name}\t${s.metadata['@lane'] || ''}\t${s.metadata['@project'] || ''}\t1\t${s.dead ? 1 : 0}\t\t0`).join('\n');
       case 'kill-session': { const s = lookup(value('-t')); machine.sessions.delete(s.name); return ''; }
+      case 'capture-pane': lookup(value('-t')); return machine.screen || '';
       case 'set-hook': return '';
       default: throw new Error(`unexpected fake tmux command ${a[0]}`);
     }
@@ -78,7 +79,7 @@ function fakeMachine() {
   return machine;
 }
 
-function serverHarness(config, machine, { dropResponse = false } = {}) {
+function serverHarness(config, machine, { dropResponse = false, readConversation } = {}) {
   let handler;
   const server = new EventEmitter(); server.listen = (...args) => args.at(-1)();
   const tmux = machine.loadTmux();
@@ -86,6 +87,7 @@ function serverHarness(config, machine, { dropResponse = false } = {}) {
     http: { createServer(fn) { handler = fn; return server; } },
     ws: { WebSocketServer: class {} }, 'node-pty': { spawn() { throw new Error('no real pty'); } },
     './lib/config': { load: () => config }, './lib/tmux': tmux,
+    ...(readConversation ? { './lib/reader': { ...require('../../lib/reader'), createReader: () => readConversation } } : {}),
   }, { setInterval: () => ({ unref() {} }), console: { log() {} } });
   return {
     async request(body, { url = '/api/sessions', method = 'POST', headers = {} } = {}) {
@@ -95,7 +97,7 @@ function serverHarness(config, machine, { dropResponse = false } = {}) {
       return new Promise((resolve) => {
         const res = { headersSent: false, setHeader() {},
           writeHead(status) { this.status = status; this.headersSent = true; },
-          end(buf) { resolve({ status: this.status, body: dropResponse ? null : JSON.parse(buf.toString()) }); } };
+          end(buf) { let body = buf.toString(); try { body = JSON.parse(body); } catch {} resolve({ status: this.status, body: dropResponse ? null : body }); } };
         handler(req, res);
       });
     },

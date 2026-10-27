@@ -255,3 +255,18 @@ test('numeric process failures return an error and leave the HTTP handler availa
   assert.equal(projects.status, 200);
   assert.ok(Array.isArray(projects.body));
 });
+
+test('saved conversation yields to a current terminal error or approval and resumes after recovery', async t => {
+  const f = fixture(t), saved = { source: 'conversation', messages: [{ id: '1', role: 'assistant', text: 'Earlier answer' }] };
+  const server = serverHarness(f.config, f.machine, { readConversation: async () => saved });
+  const started = await server.request({ ...f.payload, requestId: ID });
+  const read = () => server.request({}, { method: 'GET', url: `/api/sessions/${started.body.name}/history?format=reader` });
+  f.machine.screen = 'Earlier answer\nReady for another message';
+  assert.deepEqual((await read()).body, saved);
+  for (const message of ['Error: connection interrupted; please retry.', 'Authentication required. Sign in to continue.', 'RESOURCE_EXHAUSTED: quota exceeded', 'Allow this command?\n1. Yes\n2. No']) {
+    f.machine.screen = 'Earlier answer\n' + message;
+    assert.equal((await read()).body, f.machine.screen);
+  }
+  f.machine.screen = 'New answer\nReady for another message';
+  assert.deepEqual((await read()).body, saved);
+});

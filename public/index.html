@@ -92,12 +92,16 @@
     <button class="back" data-go="list" aria-label="Back to tasks">‹</button>
     <div class="title">
       <span id="t-name"></span>
-      <div class="title-meta"><span id="t-context"></span><span id="t-status" class="pill"></span><span id="connection-state" class="connection" role="status" aria-live="polite"></span></div>
+      <div class="title-meta"><span id="t-context"></span><span id="output-source"></span><span id="t-status" class="pill"></span><span id="connection-state" class="connection" role="status" aria-live="polite"></span></div>
     </div>
     <button id="mode-btn" aria-label="Switch to live terminal">Live</button>
     <button id="kill-btn" class="danger">End</button>
   </header>
-  <p id="startup-note" class="field-help startup-note" role="status" hidden></p>
+  <section id="startup-note" class="startup-note" aria-label="Task help" hidden>
+    <p id="startup-help" class="field-help" role="status"></p>
+    <button id="startup-respond" class="text-button" aria-controls="keys" aria-expanded="false" hidden>Respond</button>
+    <button id="dismiss-startup" class="text-button" aria-label="Dismiss startup help" hidden>Dismiss</button>
+  </section>
   <div id="reader-tools" class="reader-tools" hidden><span>Conversation</span><button id="answer-start" hidden>↑ Answer start</button></div>
   <div class="stage">
     <p id="reader-state" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
