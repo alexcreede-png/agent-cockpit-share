@@ -239,3 +239,19 @@ test('create route preserves guard, pairing, project and payload checks before r
   assert.equal(mismatch.status, 409); assert.equal(mismatch.body.code, 'START_REQUEST_MISMATCH');
   assert.equal(f.machine.creates(), 1);
 });
+
+// A pane can disappear after requireSession succeeds while the phone polls history.
+test('numeric process failures return an error and leave the HTTP handler available', async (t) => {
+  const f = fixture(t), server = serverHarness(f.config, f.machine);
+  const started = await server.request({ ...f.payload, requestId: ID });
+  assert.equal(started.status, 200);
+  f.machine.before = async (args) => {
+    if (args[0] === 'capture-pane') throw Object.assign(new Error('pane ended during capture'), { code: 1 });
+  };
+  const failed = await server.request({}, { method: 'GET', url: `/api/sessions/${started.body.name}/history` });
+  assert.equal(failed.status, 500);
+  assert.deepEqual(failed.body, { error: 'pane ended during capture' });
+  const projects = await server.request({}, { method: 'GET', url: '/api/projects' });
+  assert.equal(projects.status, 200);
+  assert.ok(Array.isArray(projects.body));
+});

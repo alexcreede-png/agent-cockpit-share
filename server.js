@@ -221,7 +221,7 @@ const server = http.createServer((req, res) => {
   handle(req, res).catch((e) => {
     log('error', e.message);
     if (!res.headersSent) send(res, e.status || 500, { error: e.message,
-      ...(e.code && e.code.startsWith('START_') ? { code: e.code, requestId: e.requestId, name: e.sessionName } : {}) });
+      ...(typeof e.code === 'string' && e.code.startsWith('START_') ? { code: e.code, requestId: e.requestId, name: e.sessionName } : {}) });
   });
 });
 

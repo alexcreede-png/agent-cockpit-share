@@ -53,6 +53,17 @@ test('working spinner footer is not mistaken for a prompt', () => {
   assert.notEqual(classify(null, '✻ Thinking… (12s · esc to interrupt)', 0, false).status, 'needs-you');
 });
 
+test('Antigravity cancel footer during work does not request a response', () => {
+  const screen = '⢿  Working...\n> Accept-edits mode: file edits auto-approve...\nesc to cancel';
+  const first = classify(null, screen, 0, false);
+  assert.notEqual(first.status, 'needs-you');
+  assert.equal(first.event, null);
+  const next = classify(first.tracker, screen.replace('⢿', '⡿'), 2000, false);
+  assert.equal(next.status, 'working');
+  assert.equal(next.event, null);
+  assert.equal(classify(next.tracker, 'Allow this command?\nesc to cancel', 4000, false).status, 'needs-you');
+});
+
 test('first sighting reads idle immediately', () => assert.equal(classify(null, 'static', 0, false).status, 'idle'));
 
 // Text captured from a disposable Codex folder-access screen; path omitted.
