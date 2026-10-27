@@ -12,7 +12,7 @@ test('public/app.js compiles as a script', () => {
   assert.doesNotThrow(() => new vm.Script(src, { filename: 'app.js' }));
 });
 
-function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, history = '', historyError = false, createFlow = false } = {}) {
+function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, history = '', historyError = false, createFlow = false, startRecovery = false, savedStarts = new Map(), storageDenied = false, cryptoDenied = false } = {}) {
   class Element {
     constructor() {
       this.children = []; this.dataset = {}; this.style = {}; this.value = ''; this.hidden = false;
@@ -36,6 +36,7 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
     addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
     fire(type, event = {}) { for (const fn of this.listeners[type] || []) fn(event); }
     click() { return this.onclick?.(); }
+    focus() { document.activeElement = this; }
   }
   const elements = new Map();
   const el = (id) => { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); };
@@ -45,7 +46,7 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
   };
   const calls = [], uploads = [], terminals = [], sockets = [], timers = [], observers = [];
   let historyText = history, failHistory = historyError;
-  const setup = { projectError: false, createError: false, holdCreate: false, finishCreate: null };
+  const setup = { startRecovery, projectError: false, createError: false, loseResponse: false, errorCode: '', errorStatus: 503, badReply: false, holdCreate: false, finishCreate: null };
   const exampleProjects = [{path:'/example/alpha',label:'Alpha project'},{path:'/example/beta',label:'Beta project'}];
   let finishSend;
   class XHR {
@@ -87,6 +88,12 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
     matchMedia: () => ({ matches: true }), XMLHttpRequest: XHR, MediaRecorder: FakeMediaRecorder, Blob,
     Terminal: FakeTerminal, WebSocket: FakeSocket, FitAddon: { FitAddon: class { fit() {} } },
     AbortController,
+    crypto: { getRandomValues: (bytes) => { if (cryptoDenied) throw new Error('unavailable'); return require('node:crypto').randomFillSync(bytes); } },
+    sessionStorage: {
+      getItem: k => { if (storageDenied) throw new Error('denied'); return savedStarts.get(k) || null; },
+      setItem: (k,v) => { if (storageDenied) throw new Error('denied'); savedStarts.set(k,v); },
+      removeItem: k => { if (storageDenied) throw new Error('denied'); savedStarts.delete(k); },
+    },
     location: { hash: '', protocol: 'https:', host: 'example.test' }, history: { replaceState() {} },
     localStorage: { getItem: () => null, setItem() {} }, ResizeObserver: class {
       constructor(fn) { this.fn = fn; observers.push(this); }
@@ -110,17 +117,18 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
       if (createFlow && path === '/api/sessions' && setup.holdCreate) {
         await new Promise(resolve => { setup.finishCreate = resolve; });
       }
-      const body = path === '/api/state' ? { lanes: createFlow ? ['claude','codex','grok','agy','shell'] : [], sessions: [], transcribe: false }
-        : path === '/api/projects' ? exampleProjects : path === '/api/sessions' ? {name:'synthetic-created'} : {};
-      const failed = (setup.projectError && path === '/api/projects') || (setup.createError && path === '/api/sessions') || (failHistory && path.includes('/history')) || (failSend && path === '/api/sessions/a/keys') || (failEnd && path === '/api/sessions/a/end');
-      return { ok: !failed, status: failed ? failSendStatus : 200,
+      if (path === '/api/sessions' && setup.loseResponse) throw new Error('response lost');
+      const body = path === '/api/state' ? { startRecovery: setup.startRecovery, lanes: createFlow ? ['claude','codex','grok','agy','shell'] : [], sessions: [], transcribe: false }
+        : path === '/api/projects' ? exampleProjects : path === '/api/sessions' ? {name:'synthetic-created', ...(setup.badReply ? {} : {requestId: JSON.parse(opts.body).requestId}), reused: false} : {};
+      const failed = (setup.projectError && path === '/api/projects') || ((setup.createError || setup.errorCode) && path === '/api/sessions') || (failHistory && path.includes('/history')) || (failSend && path === '/api/sessions/a/keys') || (failEnd && path === '/api/sessions/a/end');
+      return { ok: !failed, status: failed ? (path === '/api/sessions' && (setup.errorCode || setup.createError) ? setup.errorStatus : failSendStatus) : 200,
         headers: { get: () => path.includes('/history') ? 'text/plain' : 'application/json' },
-        json: async () => failed ? { error: 'unavailable' } : body,
+        json: async () => failed ? { error: 'unavailable', code: setup.errorCode, requestId: path === '/api/sessions' ? JSON.parse(opts.body).requestId : undefined, name: 'synthetic-created' } : body,
         text: async () => path.includes('/history') ? historyText : '' };
     },
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8'), context);
-  return { context, el, calls, uploads, terminals, sockets, timers, observers, setup,
+  return { context, el, calls, uploads, terminals, sockets, timers, observers, setup, savedStarts,
     setHistory: (text) => { historyText = text; }, setHistoryError: (value) => { failHistory = value; }, finishSend: () => finishSend?.() };
 }
 
@@ -309,14 +317,15 @@ test('failed send retains the draft and failed end keeps the session open', asyn
   await h.el('#kill-btn').click();
   assert.equal(vm.runInContext('current', h.context), 'a');
   assert.equal(h.el('#term-view').hidden, false);
-  assert.match(h.el('#delivery').textContent, /Could not end session/);
+  assert.match(h.el('#delivery').textContent, /Could not end task/);
 });
 
-test('project identity is readable while full session name stays accessible', () => {
+test('project identity is spoken plainly while the internal name remains in the title', () => {
   const h = frontend();
   vm.runInContext("projectsRoot = '/example/projects'; renderTermIdentity({ name: 'codex-agent-cockpit-1234', lane: 'codex', project: '/example/projects/agent-cockpit', status: 'working' }, 'codex-agent-cockpit-1234')", h.context);
   assert.equal(h.el('#t-name').textContent, 'agent-cockpit');
-  assert.match(h.el('#t-name')['aria-label'], /codex-agent-cockpit-1234/);
+  assert.equal(h.el('#t-name')['aria-label'], 'agent-cockpit');
+  assert.match(h.el('#t-name').title, /codex-agent-cockpit-1234/);
   assert.equal(h.el('#t-context').textContent, 'Codex');
 });
 
@@ -492,8 +501,8 @@ test('captured Read geometry accepts immediate scrollback and unchanged polling 
 
 
 // Exercise actual app handlers with a synthetic HTTP boundary; layout/hit targets live in verify-ui.
-async function setupTask() {
-  const h = frontend({createFlow:true});
+async function setupTask(options = {}) {
+  const h = frontend({createFlow:true, ...options});
   await tick(); h.el('#new-btn').click(); await tick();
   h.el('#lanes').children.find(b => b.dataset.lane === 'grok').click();
   h.el('#projects').children[0].firstElementChild.click();
@@ -577,4 +586,246 @@ test('an assistant can open without a first message', async () => {
   await h.el('#start-btn').click();
   assert.deepEqual(JSON.parse(h.calls.find(c=>c.path==='/api/sessions').opts.body),{lane:'grok',project:'/example/alpha',prompt:''});
   assert.equal(h.el('#term-view').hidden,false);
+});
+
+
+const startCalls = h => h.calls.filter(c => c.path === '/api/sessions');
+const startBody = h => JSON.parse(startCalls(h).at(-1).opts.body);
+const storageKey = 'cockpit-pending-start-v1';
+const pendingFixture = () => ({ version: 1, created: Date.now(), draft: 'Original task', filter: 'Alpha',
+  request: {lane:'grok',project:'/example/alpha',prompt:'Original task',requestId:'original_request_123456789'} });
+const separateTask = h => { h.el('#different-task').click(); h.el('#confirm-different').click(); };
+
+test('response loss checks the same immutable request, with no duplicate automatic POST', async () => {
+  const h = await setupTask({startRecovery:true});
+  h.el('#prompt').value = 'Original task'; h.setup.loseResponse = true;
+  await h.el('#start-btn').click();
+  const original = startBody(h);
+  assert.match(original.requestId,/^[a-f0-9]{48}$/);
+  assert.equal(h.savedStarts.size,1);
+  assert.equal(h.el('#start-btn').textContent,'Check start');
+  assert.equal(h.el('#prompt').disabled,true);
+  assert.equal(h.el('#project-filter').disabled,true);
+  assert.ok(h.el('#lanes').children.every(b=>b.disabled));
+  assert.ok(h.el('#projects').children.every(li=>li.firstElementChild.disabled));
+  assert.match(h.el('#pending-info').textContent,/24 hours/);
+  // Even synthetic/programmatic input changes cannot alter the captured request.
+  h.el('#prompt').value = 'Changed task'; h.el('#prompt').oninput();
+  h.el('#lanes').children.find(b=>b.dataset.lane==='agy').click();
+  h.el('#projects').children[1].firstElementChild.click();
+  await vm.runInContext('refresh()',h.context);
+  assert.equal(startCalls(h).length,1,'polling cannot retry a start');
+  h.setup.loseResponse = false;
+  await h.el('#start-btn').click();
+  assert.deepEqual(startBody(h),original);
+  assert.equal(startCalls(h)[1].opts.body,startCalls(h)[0].opts.body,'wire body is unchanged');
+  assert.equal(h.savedStarts.size,0);
+  assert.equal(h.el('#prompt').value,'Changed task','confirmation cannot clear a newer draft');
+  assert.match(h.el('#start-state').textContent,/Terminal created.*setup or sign-in/);
+});
+
+test('reload restores pending choices and draft without sending; explicit check uses original ID', async () => {
+  const h = await setupTask({startRecovery:true});
+  h.el('#prompt').value = 'Original task'; h.el('#project-filter').value = 'Alpha';
+  h.setup.loseResponse = true; await h.el('#start-btn').click();
+  const original = startBody(h);
+  const restored = frontend({createFlow:true,startRecovery:true,savedStarts:h.savedStarts});
+  await tick(); restored.el('#new-btn').click(); await tick();
+  assert.equal(restored.el('#prompt').value,'Original task');
+  assert.equal(restored.el('#project-filter').value,'Alpha');
+  assert.equal(restored.el('#lanes').children[0]['aria-pressed'],'true');
+  assert.match(restored.el('#selected-project').textContent,/Alpha project/);
+  assert.equal(restored.el('#prompt').disabled,true);
+  assert.equal(startCalls(restored).length,0);
+  await restored.el('#start-btn').click();
+  assert.deepEqual(startBody(restored),original);
+  assert.equal(restored.el('#prompt').value,'');
+  assert.equal(restored.savedStarts.size,0);
+});
+
+test('different task requires an explained explicit choice, then generates a fresh ID only on launch', async () => {
+  const h = await setupTask({startRecovery:true});
+  h.setup.loseResponse = true; h.el('#prompt').value = 'First task';
+  await h.el('#start-btn').click(); const old = startBody(h);
+  h.el('#different-task').click();
+  assert.equal(h.el('#different-confirm').hidden,false);
+  assert.equal(startCalls(h).length,1);
+  h.el('#keep-start').click();
+  assert.equal(h.el('#different-confirm').hidden,true);
+  assert.equal(h.el('#prompt').disabled,true);
+  separateTask(h);
+  assert.equal(h.el('#prompt').disabled,false);
+  assert.equal(h.savedStarts.size,0);
+  assert.equal(startCalls(h).length,1);
+  h.el('#prompt').value = 'Second task'; h.setup.loseResponse = false;
+  await h.el('#start-btn').click();
+  assert.notEqual(startBody(h).requestId,old.requestId);
+  assert.equal(startBody(h).prompt,'Second task');
+});
+
+test('malformed, stale, oversized or unexpected pending storage is discarded safely without POST', async () => {
+  const stale = pendingFixture(); stale.created -= 25 * 60 * 60 * 1000;
+  const future = pendingFixture(); future.created += 120000;
+  const badId = pendingFixture(); badId.request.requestId = 'invalid';
+  const changed = pendingFixture(); changed.draft = 'Different prompt';
+  const extras = pendingFixture(); extras.token = 'never accepted';
+  const badLane = pendingFixture(); badLane.request.lane = '__proto__';
+  const longPrompt = pendingFixture(); longPrompt.request.prompt = longPrompt.draft = 'x'.repeat(8001);
+  for (const raw of ['{broken', 'null', 'x'.repeat(131073), ...[stale,future,badId,changed,extras,badLane,longPrompt].map(JSON.stringify)]) {
+    const savedStarts = new Map([[storageKey,raw]]);
+    const h = frontend({createFlow:true,startRecovery:true,savedStarts});
+    await tick(); h.el('#new-btn').click(); await tick();
+    assert.equal(startCalls(h).length,0);
+    assert.equal(savedStarts.size,0);
+    assert.equal(h.el('#prompt').value,'');
+    assert.match(h.el('#pending-info').textContent,/unavailable or expired.*Check Your tasks/);
+  }
+});
+
+test('storage denial keeps in-memory checking and truthfully warns that reload recovery is unavailable', async () => {
+  const h = await setupTask({startRecovery:true,storageDenied:true});
+  h.el('#prompt').value='Memory only'; h.setup.loseResponse=true;
+  await h.el('#start-btn').click(); const first = startBody(h);
+  assert.match(h.el('#pending-info').textContent,/Reload recovery is unavailable.*Keep this page open/);
+  assert.doesNotMatch(h.el('#pending-info').textContent,/Saved in this tab/);
+  h.setup.loseResponse=false; await h.el('#start-btn').click();
+  assert.deepEqual(startBody(h),first);
+});
+
+test('missing secure randomness never falls back to a weak ID or sends a request', async () => {
+  const h = await setupTask({startRecovery:true,cryptoDenied:true});
+  h.el('#prompt').value='Keep me'; await h.el('#start-btn').click();
+  assert.equal(startCalls(h).length,0);
+  assert.equal(h.el('#prompt').value,'Keep me');
+  assert.match(h.el('#new-err').textContent,/Can’t prepare a safe start/);
+});
+
+test('capability absence keeps legacy failures honest and cannot check a restored ID on an old server', async () => {
+  const h = await setupTask(); h.setup.loseResponse = true;
+  await h.el('#start-btn').click();
+  assert.equal(startBody(h).requestId,undefined);
+  assert.notEqual(h.el('#start-btn').textContent,'Check start');
+  assert.match(h.el('#start-capability').textContent,/Start checks aren’t available/);
+  assert.match(h.el('#new-err').textContent,/Check Your tasks before trying again/);
+  assert.doesNotMatch(h.el('#new-err').textContent,/won’t open a second/);
+  const restored = frontend({createFlow:true,savedStarts:new Map([[storageKey,JSON.stringify(pendingFixture())]])});
+  await tick(); restored.el('#new-btn').click(); await tick();
+  assert.equal(restored.el('#start-btn').disabled,true);
+  assert.match(restored.el('#pending-info').textContent,/can’t safely check/);
+  assert.equal(startCalls(restored).length,0);
+});
+
+test('START errors retain identity, expose recovery guidance and never silently start anew', async () => {
+  for (const [code, pattern, disabled] of [
+    ['START_UNCONFIRMED',/Check start.*original request/,false],
+    ['START_SESSION_ENDED',/has ended.*won’t restart/,true],
+    ['START_REQUEST_MISMATCH',/different details.*Check Your tasks/,true],
+    ['START_INVALID_REQUEST_ID',/couldn’t use.*Check Your tasks/,true],
+  ]) {
+    const h = await setupTask({startRecovery:true});
+    h.setup.errorCode=code;
+    h.setup.errorStatus=code==='START_INVALID_REQUEST_ID'?400:409;
+    await h.el('#start-btn').click();
+    assert.match(h.el('#new-err').textContent,pattern);
+    assert.equal(h.el('#start-btn').disabled,disabled);
+    assert.equal(h.savedStarts.size,1);
+    assert.equal(startCalls(h).length,1);
+    assert.equal(JSON.parse(h.savedStarts.get(storageKey)).request.requestId,startBody(h).requestId);
+    const surfaced = await vm.runInContext("post('/api/sessions', pendingStart.request).catch(e => ({code:e.code,requestId:e.requestId,sessionName:e.sessionName,status:e.status}))",h.context);
+    assert.equal(surfaced.code,code); assert.equal(surfaced.requestId,startBody(h).requestId);
+    assert.equal(surfaced.sessionName,'synthetic-created');
+  }
+});
+
+test('success missing matching requestId stays pending, never implying readiness', async () => {
+  const h = await setupTask({startRecovery:true}); h.setup.badReply=true;
+  h.el('#prompt').value='Original'; await h.el('#start-btn').click();
+  assert.equal(h.el('#term-view').hidden,true);
+  assert.equal(h.savedStarts.size,1);
+  assert.equal(h.el('#prompt').value,'Original');
+  assert.match(h.el('#new-err').textContent,/Start wasn’t confirmed/);
+});
+
+test('late completion cannot navigate away, clear a newer draft or remove a newer pending launch', async () => {
+  const h = await setupTask({startRecovery:true});
+  h.el('#prompt').value='Old task'; h.setup.holdCreate=true;
+  const oldLaunch=h.el('#start-btn').click(); await tick();
+  const finishOld=h.setup.finishCreate, oldId=startBody(h).requestId;
+  separateTask(h);
+  h.el('#prompt').value='New task'; h.el('#prompt').oninput();
+  const newLaunch=h.el('#start-btn').click(); await tick();
+  const finishNew=h.setup.finishCreate, newId=startBody(h).requestId;
+  assert.notEqual(newId,oldId);
+  vm.runInContext("show('list')",h.context);
+  finishOld(); await oldLaunch;
+  assert.equal(h.el('#list-view').hidden,false);
+  assert.equal(h.el('#prompt').value,'New task');
+  assert.equal(JSON.parse(h.savedStarts.get(storageKey)).request.requestId,newId);
+  finishNew(); await newLaunch;
+  assert.equal(h.el('#list-view').hidden,false);
+  assert.equal(h.el('#prompt').value,'New task','late success preserves the draft after leaving setup');
+  assert.equal(h.savedStarts.size,0);
+});
+
+
+test('checking an existing pending launch does not depend on a fresh project list or editable choices', async () => {
+  const h=await setupTask({startRecovery:true}); h.setup.loseResponse=true;
+  h.el('#prompt').value='Original'; await h.el('#start-btn').click(); const original=startBody(h);
+  h.setup.projectError=true; h.el('#new-btn').click(); await tick();
+  assert.equal(h.el('#retry-projects').hidden,false);
+  assert.equal(h.el('#start-btn').disabled,false,'the original request remains checkable');
+  h.setup.loseResponse=false; await h.el('#start-btn').click();
+  assert.deepEqual(startBody(h),original);
+});
+
+test('capability loss disables an existing check until the server advertises support again', async () => {
+  const h=await setupTask({startRecovery:true}); h.setup.loseResponse=true;
+  await h.el('#start-btn').click(); const original=startBody(h);
+  h.setup.startRecovery=false; await vm.runInContext('refresh()',h.context);
+  assert.equal(h.el('#start-btn').disabled,true);
+  assert.doesNotMatch(h.el('#pending-info').textContent,/won’t open a second/);
+  h.setup.startRecovery=true; await vm.runInContext('refresh()',h.context);
+  assert.equal(h.el('#start-btn').disabled,false);
+  h.setup.loseResponse=false; await h.el('#start-btn').click();
+  assert.deepEqual(startBody(h),original);
+});
+
+test('ordinary start rejection keeps original payload until an explicit different-task choice', async () => {
+  const h=await setupTask({startRecovery:true});
+  h.el('#prompt').value='Original'; h.setup.createError=true; h.setup.errorStatus=403;
+  await h.el('#start-btn').click(); const original=startBody(h);
+  assert.equal(h.el('#prompt').disabled,true);
+  assert.equal(h.savedStarts.size,1);
+  assert.match(h.el('#new-err').textContent,/Could not open this task.*original choices/);
+  h.setup.createError=false; await h.el('#start-btn').click();
+  assert.deepEqual(startBody(h),original);
+});
+
+test('pending Terminal reload keeps the assistant draft while always checking an empty shell prompt', async () => {
+  const h=await setupTask({startRecovery:true});
+  h.el('#prompt').value='Retained assistant message';
+  h.el('#other-lanes').children.find(b=>b.dataset.lane==='shell').click();
+  h.setup.loseResponse=true; await h.el('#start-btn').click(); const original=startBody(h);
+  assert.equal(original.prompt,'');
+  const restored=frontend({createFlow:true,startRecovery:true,savedStarts:h.savedStarts});
+  await tick(); restored.el('#new-btn').click(); await tick();
+  assert.equal(restored.el('#prompt').value,'Retained assistant message');
+  assert.equal(restored.el('#prompt').disabled,true);
+  await restored.el('#start-btn').click(); assert.deepEqual(startBody(restored),original);
+  assert.match(restored.el('#startup-note').textContent,/doesn’t confirm.*accepted/);
+  restored.el('#new-btn').click(); await tick();
+  restored.el('#lanes').children.find(b=>b.dataset.lane==='grok').click();
+  assert.equal(restored.el('#prompt').value,'Retained assistant message');
+  assert.equal(restored.el('#prompt').disabled,false);
+});
+
+
+test('Grok startup Read removes centering only and preserves the complete warning and choices', () => {
+  const h = frontend();
+  const screen = '         Do you trust the contents of this directory?\n      /example/project\n    Grok Build may run or modify contents in this directory,\n         posing security risks.\n       Yes, proceed                 y\n       No, quit                     n';
+  h.context.startupScreen = screen;
+  const readable = vm.runInContext("compactReadHistory(startupScreen, 'grok')", h.context);
+  assert.equal(readable, screen.split('\n').map(line => line.trimStart()).join('\n'));
+  assert.equal(vm.runInContext("compactReadHistory(startupScreen, 'agy')", h.context), screen);
+  assert.equal(vm.runInContext("compactReadHistory('    example code', 'grok')", h.context), '    example code');
 });

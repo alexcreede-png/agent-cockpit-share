@@ -17,7 +17,7 @@ const output = Array.from({ length: 90 }, (_, i) => `Output line ${i + 1}: reada
 let fixture;
 function reset() {
   fixture = { offline: false, historyError: false, endError: false, sendError: false, projectError: false, history: output, uploadPending: null,
-    createError: false, creates: [], holdCreate: false, createPending: null, holdUpload: false, holdSend: false, sendPending: null, transcribePending: null, connections: [], sent: [], sessions: names.map((name, i) => ({ name, lane: i ? 'grok' : 'codex', project: `/example/${i ? 'beta' : 'alpha'}`, created: Date.now(), status: i ? 'needs-you' : 'idle' })) };
+    startRecovery: false, starts: new Map(), loseCreateResponse: false, createCode: '', createError: false, creates: [], holdCreate: false, createPending: null, holdUpload: false, holdSend: false, sendPending: null, transcribePending: null, connections: [], sent: [], sessions: names.map((name, i) => ({ name, lane: i ? 'grok' : 'codex', project: `/example/${i ? 'beta' : 'alpha'}`, created: Date.now(), status: i ? 'needs-you' : 'idle' })) };
 }
 const files = {
   '/': ['public/index.html', 'text/html; charset=utf-8'],
@@ -42,17 +42,25 @@ const server = http.createServer(async (req, res) => {
   }
   if (url.pathname === '/api/embed-origins') return reply(200, [`http://127.0.0.1:${server.address().port}`]);
   if (fixture.offline) return reply(503, { error: 'Synthetic offline check' });
-  if (url.pathname === '/api/state') return reply(200, { lanes: ['claude', 'codex', 'grok', 'agy', 'shell'], sessions: fixture.sessions, projectsRoot: '/example', uploadMaxMB: 2, transcribe: true });
+  if (url.pathname === '/api/state') return reply(200, { startRecovery: fixture.startRecovery, lanes: ['claude', 'codex', 'grok', 'agy', 'shell'], sessions: fixture.sessions, projectsRoot: '/example', uploadMaxMB: 2, transcribe: true });
   if (url.pathname === '/api/transcribe') { for await (const _chunk of req) {} fixture.transcribePending = () => reply(200, { text: 'dictated for alpha' }); return; }
   if (url.pathname === '/api/projects') return fixture.projectError ? reply(503, { error: 'Project list unavailable' }) : reply(200, [{ path: '/example/alpha', label: 'Alpha project' }, { path: '/example/beta', label: 'Beta project' }, { path: '/example/long', label: 'Example-' + 'architecture'.repeat(12) }]);
   if (url.pathname === '/api/sessions' && req.method === 'POST') {
     let body = ''; for await (const chunk of req) body += chunk;
     const request = JSON.parse(body); fixture.creates.push(request);
     const finish = () => {
+      if (fixture.createCode) return reply(409, {error:'Synthetic recovery error',code:fixture.createCode,requestId:request.requestId});
       if (fixture.createError) return reply(503, { error: 'Synthetic internal stack: private launch details' });
+      if (request.requestId && fixture.starts.has(request.requestId)) {
+        if (fixture.loseCreateResponse) { res.destroy(); return; }
+        return reply(200, {...fixture.starts.get(request.requestId),reused:true});
+      }
       const name = `${request.lane}-example-created-${fixture.creates.length}`;
       fixture.sessions.push({ name, lane: request.lane, project: request.project, created: Date.now(), status: 'idle' });
-      reply(200, { name });
+      const result = {name, ...(request.requestId ? {requestId:request.requestId,reused:false} : {})};
+      if (request.requestId) fixture.starts.set(request.requestId,result);
+      if (fixture.loseCreateResponse) { res.destroy(); return; }
+      reply(200, result);
     };
     if (fixture.holdCreate) fixture.createPending = finish; else finish();
     return;
@@ -92,6 +100,134 @@ async function waitUntil(fn, description, ms = 6000) {
   while (Date.now() < end) { if (await fn()) return; await pause(50); }
   throw new Error('Timed out: ' + description);
 }
+// Parent runs these against the real rendered app in both engines; no real CLI is launched.
+async function recoveryCases(engineName, browser) {
+  reset(); fixture.startRecovery = true;
+  const context = await browser.newContext({viewport:{width:390,height:844},isMobile:true,hasTouch:true});
+  const page = await context.newPage();
+  const errors=[]; page.on('pageerror',e=>errors.push(e.message));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const setup = async () => {
+    await page.locator('#new-btn').click();
+    await page.locator('#lanes').getByRole('button',{name:'Grok',exact:true}).click();
+    await page.locator('#projects').getByRole('button',{name:'Alpha project',exact:true}).click();
+  };
+  const newTask = async () => {
+    await page.locator('#different-task').click();
+    assert.match(await page.locator('#different-confirm').innerText(),/prior task may still be running/);
+    await page.locator('#confirm-different').click();
+  };
+  try {
+    await page.goto(base); await page.locator('#sessions button').first().waitFor();
+    await setup(); await page.locator('#prompt').fill('Original recovery task');
+    fixture.loseCreateResponse=true;
+    await page.locator('#start-btn').click();
+    await page.locator('#new-err').filter({hasText:'Start wasn’t confirmed'}).waitFor();
+    const original={...fixture.creates.at(-1)}, total=fixture.creates.length;
+    assert.match(original.requestId,/^[a-f0-9]{48}$/);
+    assert.equal(await page.locator('#prompt').isDisabled(),true);
+    assert.equal(await page.locator('#project-filter').isDisabled(),true);
+    assert.equal(await page.locator('#lanes button:enabled').count(),0);
+    assert.equal(await page.locator('#projects button:enabled').count(),0);
+    // A programmatic DOM edit must never alter the frozen wire request.
+    await page.locator('#prompt').evaluate(el=>{el.value='Changed behind the locked form';});
+    await page.reload();
+    await page.locator('#new-btn').filter({hasText:'Check start'}).waitFor();
+    assert.equal(fixture.creates.length,total,'reload never POSTs');
+    await page.locator('#new-btn').click();
+    assert.equal(await page.locator('#prompt').inputValue(),'Original recovery task');
+    await page.locator('#selected-project').filter({hasText:'Alpha project'}).waitFor();
+    assert.equal(await page.locator('#prompt').isDisabled(),true);
+    await page.screenshot({path:path.join(artifacts,`${engineName}-start-restored.png`)});
+    fixture.loseCreateResponse=false;
+    await page.locator('#start-btn').click(); await page.locator('#term-view').waitFor({state:'visible'});
+    assert.deepEqual(fixture.creates.at(-1),original);
+    assert.equal(fixture.sessions.filter(s=>s.name===fixture.starts.get(original.requestId).name).length,1);
+    assert.equal(await page.evaluate(()=>sessionStorage.getItem('cockpit-pending-start-v1')),null);
+    assert.match(await page.locator('#startup-note').innerText(),/doesn’t confirm.*accepted/);
+
+    await page.locator('[data-go="list"]:visible').click(); await setup();
+    await page.locator('#prompt').fill('A separate task'); fixture.createCode='START_UNCONFIRMED';
+    await page.locator('#start-btn').click();
+    await page.locator('#new-err').filter({hasText:'Start wasn’t confirmed'}).waitFor();
+    const pendingId=fixture.creates.at(-1).requestId;
+    for (const [code,text] of [['START_REQUEST_MISMATCH','different details'],['START_SESSION_ENDED','has ended']]) {
+      fixture.createCode=code;
+      // Restore permits only the same explicit check after a terminal conflict.
+      await page.reload(); await page.locator('#new-btn').filter({hasText:'Check start'}).click();
+      await page.locator('#start-btn').click();
+      await page.locator('#new-err').filter({hasText:text}).waitFor();
+      assert.equal(await page.locator('#start-btn').isDisabled(),true);
+      assert.equal(fixture.creates.at(-1).requestId,pendingId);
+    }
+    await newTask();
+    assert.equal(await page.locator('#prompt').isEnabled(),true);
+    assert.equal(await page.locator('#prompt').evaluate(el=>document.activeElement===el),true);
+    await page.locator('#prompt').fill('Intentionally fresh task'); fixture.createCode='';
+    await page.locator('#start-btn').click(); await page.locator('#term-view').waitFor({state:'visible'});
+    assert.notEqual(fixture.creates.at(-1).requestId,pendingId);
+
+    // Newer draft/pending identity wins over any old in-flight result.
+    await page.locator('[data-go="list"]:visible').click(); await setup();
+    await page.locator('#prompt').fill('Old held task'); fixture.holdCreate=true;
+    await page.locator('#start-btn').click(); await waitUntil(()=>!!fixture.createPending,'held recovery start');
+    const finishOld=fixture.createPending;
+    await newTask(); await page.locator('#prompt').fill('Newer draft');
+    await page.locator('#start-btn').click();
+    await waitUntil(()=>fixture.createPending!==finishOld,'new held recovery start');
+    const finishNew=fixture.createPending, newerId=fixture.creates.at(-1).requestId;
+    await page.locator('[data-go="list"]:visible').click(); finishOld(); await pause(100);
+    assert.equal(await page.locator('#list-view').isVisible(),true);
+    assert.equal(await page.evaluate(()=>JSON.parse(sessionStorage.getItem('cockpit-pending-start-v1')).request.requestId),newerId);
+    finishNew(); fixture.holdCreate=false;
+    await waitUntil(async()=>await page.evaluate(()=>sessionStorage.getItem('cockpit-pending-start-v1'))===null,'matching confirmation clears pending');
+    assert.equal(await page.locator('#list-view').isVisible(),true);
+    await page.locator('#new-btn').click();
+    assert.equal(await page.locator('#prompt').inputValue(),'Newer draft');
+
+    // Invalid/stale/oversized storage never revives a request or sends one.
+    const valid={version:1,created:Date.now(),draft:'Saved',filter:'',request:{lane:'grok',project:'/example/alpha',prompt:'Saved',requestId:'example_request_123456789'}};
+    for (const raw of ['{broken',JSON.stringify({...valid,created:Date.now()-25*60*60*1000}),'x'.repeat(131073)]) {
+      await page.evaluate(raw=>sessionStorage.setItem('cockpit-pending-start-v1',raw),raw);
+      const count=fixture.creates.length; await page.reload(); await page.locator('#new-btn').click();
+      assert.equal(fixture.creates.length,count);
+      assert.match(await page.locator('#pending-info').innerText(),/unavailable or expired/);
+      assert.equal(await page.locator('#prompt').inputValue(),'');
+    }
+    fixture.startRecovery=false; await page.reload(); await setup(); fixture.createError=true;
+    await page.locator('#start-btn').click(); await page.locator('#new-err').filter({hasText:'Start wasn’t confirmed'}).waitFor();
+    assert.equal(fixture.creates.at(-1).requestId,undefined);
+    assert.match(await page.locator('#start-capability').innerText(),/aren’t available/);
+    assert.doesNotMatch(await page.locator('#new-err').innerText(),/won’t open a second/);
+    fixture.createError=false;
+    assert.deepEqual(errors,[]);
+  } finally { await context.close(); }
+
+  // A storage-blocked WebView must still allow an in-memory check, with honest limits.
+  fixture.startRecovery=true;
+  const denied=await browser.newContext({viewport:{width:320,height:640},isMobile:true,hasTouch:true});
+  await denied.addInitScript(()=>Object.defineProperty(window,'sessionStorage',{get(){throw new Error('Synthetic storage denial');}}));
+  const memoryPage=await denied.newPage();
+  try {
+    await memoryPage.goto(base); await memoryPage.locator('#sessions button').first().waitFor();
+    await memoryPage.locator('#new-btn').click();
+    await memoryPage.locator('#lanes').getByRole('button',{name:'Grok',exact:true}).click();
+    await memoryPage.locator('#projects').getByRole('button',{name:'Alpha project',exact:true}).click();
+    await memoryPage.locator('#prompt').fill('Memory recovery'); fixture.createError=true;
+    await memoryPage.locator('#start-btn').click(); await memoryPage.locator('#new-err').filter({hasText:'Start wasn’t confirmed'}).waitFor();
+    const memoryRequest={...fixture.creates.at(-1)};
+    assert.match(await memoryPage.locator('#pending-info').innerText(),/Reload recovery is unavailable.*Keep this page open/);
+    for (const width of [320,390,430]) {
+      await memoryPage.setViewportSize({width,height:640});
+      const bounds=await memoryPage.locator('#new-view').evaluate(view=>({overflow:view.scrollWidth>innerWidth,button:document.querySelector('#start-btn').getBoundingClientRect().toJSON(),height:innerHeight}));
+      assert.equal(bounds.overflow,false); assert.ok(bounds.button.bottom<=bounds.height); assert.ok(bounds.button.height>=44);
+    }
+    await memoryPage.screenshot({path:path.join(artifacts,`${engineName}-start-memory-only.png`)});
+    fixture.createError=false; await memoryPage.locator('#start-btn').click(); await memoryPage.locator('#term-view').waitFor({state:'visible'});
+    assert.deepEqual(fixture.creates.at(-1),memoryRequest);
+  } finally { await denied.close(); }
+  console.log(`${engineName}: immutable start/reload, explicit separate task, START conflicts, late completion, storage corruption/denial and capability gate PASS`);
+}
 async function run(engineName, engine) {
   reset();
   const executablePath = process.env[`COCKPIT_${engineName.toUpperCase()}_EXECUTABLE`];
@@ -120,8 +256,8 @@ async function run(engineName, engine) {
     assert.equal(await sessions.getByRole('button').count(), 0);
     assert.ok((await frame.locator('#list-state').innerText()).length > 0);
     await frame.locator('#session-search').fill('');
-    const alpha = () => sessions.getByRole('button', { name: new RegExp(names[0]) });
-    const beta = () => sessions.getByRole('button', { name: new RegExp(names[1]) });
+    const alpha = () => sessions.getByRole('button', { name: /^alpha, Idle, Codex,/ });
+    const beta = () => sessions.getByRole('button', { name: /^beta, Needs you, Grok,/ });
     await alpha().focus(); await pause(3200);
     assert.equal(await alpha().evaluate(el => document.activeElement === el), true, 'polling preserves session-button focus');
     await alpha().press('Enter');
@@ -266,6 +402,8 @@ async function run(engineName, engine) {
     await page.screenshot({ path: path.join(artifacts, `${engineName}-new-long-project.png`) });
     await frame.locator('[data-go="list"]:visible').click();
     await frame.locator('#new-btn').click();
+    assert.equal(await frame.locator('#new-view .form').evaluate(el=>el.scrollTop), 0, 'returning to setup starts at the assistant choice');
+    assert.equal(await frame.locator('#start-state').innerText(), '', 'returning to setup clears an old success notice');
     await waitUntil(async()=>await frame.locator('#start-btn').isEnabled(), 'retained project loaded');
     assert.equal(await frame.locator('#prompt').inputValue(), 'Please help with the alpha project.');
     assert.equal(await grok.getAttribute('aria-pressed'), 'true');
@@ -452,14 +590,25 @@ async function run(engineName, engine) {
     const keysToggle = frame.locator('#keys-toggle');
     await keysToggle.click();
     assert.equal(await keysToggle.getAttribute('aria-expanded'), 'true');
+    assert.equal(await frame.locator('#keys button').first().innerText(), 'Escape');
+    for (const key of ['Down', 'Up']) {
+      await frame.locator('#keys').getByRole('button', { name: key, exact: true }).click();
+      await waitUntil(() => fixture.sent.at(-1)?.key === key, `phone ${key} response`);
+      assert.equal(await keysToggle.getAttribute('aria-expanded'), 'true', 'selection keeps response controls open');
+    }
+    fixture.sendError = true;
+    await frame.locator('#keys').getByRole('button', { name: 'Escape' }).click();
+    await frame.locator('#delivery').filter({hasText:'Key failed'}).waitFor();
+    assert.equal(await keysToggle.getAttribute('aria-expanded'), 'true', 'failed key keeps response controls available');
+    fixture.sendError = false;
     await frame.locator('#keys').getByRole('button', { name: 'Escape' }).press('Enter');
     await waitUntil(() => fixture.sent.at(-1)?.key === 'Escape', 'short-frame Escape key');
-    assert.equal(await keysToggle.getAttribute('aria-expanded'), 'false');
+    await waitUntil(async () => await keysToggle.getAttribute('aria-expanded') === 'false', 'acknowledged response closes controls');
     assert.equal(await keysToggle.evaluate(el => document.activeElement === el), true, 'key sheet restores focus');
     await keysToggle.click();
     await frame.locator('#keys').getByRole('button', { name: 'Submit current terminal input' }).click();
     await waitUntil(() => fixture.sent.at(-1)?.key === 'Enter', 'short-frame Enter key');
-    assert.equal(await keysToggle.getAttribute('aria-expanded'), 'false');
+    await waitUntil(async () => await keysToggle.getAttribute('aria-expanded') === 'false', 'acknowledged response closes controls');
     const hitBounds = await frame.locator('#term-view').evaluate(view => Array.from(view.querySelectorAll('.bar button, .input-row button')).filter(b => b.getBoundingClientRect().height > 0).map(b => ({label:b.getAttribute('aria-label') || b.textContent.trim(),width:b.getBoundingClientRect().width,height:b.getBoundingClientRect().height})));
     for (const hit of hitBounds) assert.ok(hit.width >=44 && hit.height>=44, JSON.stringify(hit));
     console.log(engineName, 'short-frame primary hit targets:', JSON.stringify(hitBounds));
@@ -475,10 +624,22 @@ async function run(engineName, engine) {
     assert.equal(await frame.locator('#new-view').isVisible(),true);
     assert.deepEqual(errors, []);
     console.log(`${engineName}: keyboard/focus, drafts, delayed upload/timeout recovery, failed send/end, scroll, live reconnect/session isolation, responsive layouts, crowded short frame and new-session flow PASS`);
+    await context.close();
+    await recoveryCases(engineName,browser);
   } finally { await browser.close(); }
 }
 (async () => {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  try { await run('webkit', webkit); await run('chromium', chromium); console.log('Screenshots:', artifacts); }
+  try {
+    for (const [name, engine] of [['webkit', webkit], ['chromium', chromium]]) {
+      if (process.env.COCKPIT_UI_ENGINE && process.env.COCKPIT_UI_ENGINE !== name) continue;
+      if (process.env.COCKPIT_UI_RECOVERY_ONLY === '1') {
+        const executablePath = process.env[`COCKPIT_${name.toUpperCase()}_EXECUTABLE`];
+        const browser = await engine.launch({headless:true,...(executablePath?{executablePath}:{})});
+        try { await recoveryCases(name, browser); } finally { await browser.close(); }
+      } else await run(name, engine);
+    }
+    console.log('Screenshots:', artifacts);
+  }
   finally { for (const client of terminalServer.clients) client.terminate(); terminalServer.close(); await new Promise(resolve => server.close(resolve)); }
 })().catch(e => { console.error(e); process.exitCode = 1; });

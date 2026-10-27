@@ -76,9 +76,31 @@ async function freePort() {
         await page.locator('#more-assistants summary').click();
         await page.locator('#other-lanes').getByRole('button',{name:'Terminal',exact:true}).click();
         await page.locator('#projects').getByRole('button',{name:'example',exact:true}).click();
+        const startRequests = [];
+        await page.route('**/api/sessions', async route => {
+          if (route.request().method() !== 'POST') return route.continue();
+          startRequests.push(route.request().postDataJSON());
+          if (startRequests.length === 1) {
+            const response = await route.fetch();
+            assert.equal(response.status(), 200, 'real backend created original task');
+            await route.abort('failed'); // Lose the response after the actual launch.
+          } else await route.continue();
+        });
+        await page.locator('#start-btn').click();
+        await page.locator('#new-err').filter({hasText:'Start wasn’t confirmed'}).waitFor();
+        assert.equal((await(await fetch(base+'/api/state')).json()).sessions.length, 1);
+        await page.reload();
+        await page.locator('#new-btn').filter({hasText:'Check start'}).waitFor();
+        await pause(1700);
+        assert.equal(startRequests.length, 1, 'reload never resubmits automatically');
+        await page.locator('#new-btn').click();
         await page.locator('#start-btn').click();
         await page.locator('#reader').filter({hasText:'DELIVERY FIXTURE READY'}).waitFor();
-        name=decodeURIComponent(new URL(page.url()).hash.slice(1));assert.ok(name.startsWith('shell-example-'));
+        assert.equal(startRequests.length, 2);
+        assert.deepEqual(startRequests[1], startRequests[0], 'explicit retry uses original immutable request');
+        assert.equal((await(await fetch(base+'/api/state')).json()).sessions.length, 1, 'one actual terminal after recovery');
+        await page.screenshot({path:path.join(tmp,engineName+'-recovered-start.png')});
+        name=decodeURIComponent(new URL(page.url()).hash.slice(1));assert.match(name, /^shell-start-[a-f0-9]{32}$/);
         const initial=readReceipts().length;
         const messages=[`${engineName} unique single reply`,`${engineName} first line\nsecond line`, `dense:${engineName} final marker`];
         for(let index=0;index<messages.length;index++) {
@@ -105,7 +127,7 @@ async function freePort() {
         await page.locator('#kill-btn').click();await page.locator('#kill-btn').click();
         await page.locator('#list-view').waitFor({state:'visible'});name=null;
         assert.equal((await(await fetch(base+'/api/state')).json()).sessions.length,0);
-        console.log(`${engineName}: real browser Send → isolated tmux fixture → rendered single/multiline replies, exactly-once submit, shrink/Latest focus, end PASS`);
+        console.log(`${engineName}: real lost-start response/reload/same-request recovery, browser Send → isolated tmux fixture → rendered single/multiline replies, exactly-once submit, shrink/Latest focus, end PASS`);
       } finally {await browser.close();}
     }
   } finally {

@@ -28,6 +28,7 @@ const CFG = {
 };
 const NOTIFY = config.notify && !!config.notifyCommand;
 tmux.configure({ sessionClosedCommand: config.sessionClosedCommand, uploadsDir: config.uploadsDir });
+const starts = require('./lib/starts').createStarter({ stateDir: config.stateDir, tmux });
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -116,20 +117,20 @@ async function handle(req, res) {
   if (req.method === 'GET' && p === '/api/state') {
     const sessions = (await tmux.list()).map((s) => ({ ...s, status: statusOf.get(s.name) || (s.dead ? 'exited' : 'idle') }));
     return send(res, 200, { lanes: Object.keys(tmux.LANES), sessions, notify: NOTIFY, projectsRoot: config.projectsRoot,
-      transcribe: !!config.transcribeCommand, uploadMaxMB: config.uploadMaxMB });
+      startRecovery: true, transcribe: !!config.transcribeCommand, uploadMaxMB: config.uploadMaxMB });
   }
   if (req.method === 'GET' && p === '/api/projects') return send(res, 200, guard.listProjects(config));
 
   if (req.method === 'POST' && p === '/api/sessions') {
     const body = await readJson(req);
-    if (!tmux.LANES[body.lane]) return send(res, 400, { error: 'unknown lane' });
+    if (typeof body.lane !== 'string' || !Object.hasOwn(tmux.LANES, body.lane)) return send(res, 400, { error: 'unknown lane' });
     const project = guard.resolveProject(body.project, config);
     if (!project) return send(res, 403, { error: 'project not allowed' });
     const prompt = typeof body.prompt === 'string' ? body.prompt : '';
     if (prompt.length > 8000) return send(res, 413, { error: 'First message is too long (maximum 8,000 characters). Shorten it and try again.' });
-    const name = await tmux.create({ lane: body.lane, project, prompt });
-    log('created', name, body.lane);
-    return send(res, 200, { name });
+    const result = await starts.start({ lane: body.lane, project, prompt }, body.requestId);
+    log(result.reused ? 'reconciled' : 'created', result.name, body.lane);
+    return send(res, 200, result);
   }
 
   if (req.method === 'POST' && p === '/api/transcribe') {
@@ -217,7 +218,11 @@ const server = http.createServer((req, res) => {
   if (devices && p === '/api/state' && req.headers['x-cockpit-device'] && Date.now() - lastHeaderLog > 600000) {
     lastHeaderLog = Date.now(); log('paired via header token');
   }
-  handle(req, res).catch((e) => { log('error', e.message); if (!res.headersSent) send(res, e.status || 500, { error: e.message }); });
+  handle(req, res).catch((e) => {
+    log('error', e.message);
+    if (!res.headersSent) send(res, e.status || 500, { error: e.message,
+      ...(e.code && e.code.startsWith('START_') ? { code: e.code, requestId: e.requestId, name: e.sessionName } : {}) });
+  });
 });
 
 // ---------- live terminal over WebSocket ----------

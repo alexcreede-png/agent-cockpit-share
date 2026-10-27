@@ -23,8 +23,9 @@
   </header>
   <div class="home-heading"><h2>Your tasks</h2><p id="summary" class="muted">Tasks run on your Mac.</p></div>
   <div class="list-tools"><label class="sr-only" for="session-search">Search tasks</label><input id="session-search" type="search" placeholder="Search tasks or projects" autocomplete="off"></div>
+  <p id="pending-list" class="field-help pending-list" role="status" hidden></p>
   <ul id="sessions"></ul>
-  <p id="list-state" class="muted center" role="status">Loading sessions…</p>
+  <p id="list-state" class="muted center" role="status">Loading tasks…</p>
   <div id="empty" class="empty-state" hidden><span class="empty-symbol" aria-hidden="true">＋</span><h2>Start something on your Mac</h2><p>Choose Grok or Gemini / Antigravity, pick a project, and describe your task.</p><p>Your tasks run on the Mac and keep running when you leave this app. Return here to read and reply.</p><button id="empty-new-btn" class="primary">New task</button></div>
   <p id="conn" class="warn center" role="alert" hidden>Can’t reach the Mac. Reconnecting…</p>
 </section>
@@ -47,6 +48,7 @@
     <h1>New task</h1>
   </header>
   <div class="form">
+    <p id="pending-info" class="field-help" role="status"></p>
     <p class="form-intro">Start on your Mac. Come back whenever you’re ready.</p>
     <section class="form-section" aria-labelledby="lane-label">
       <h2 id="lane-label"><span>1</span> Choose an assistant</h2>
@@ -73,6 +75,13 @@
   <div class="launch-footer">
     <p id="start-state" class="field-help" role="status" aria-live="polite"></p>
     <p id="new-err" class="warn" role="alert"></p>
+    <p id="start-capability" class="field-help"></p>
+    <button id="different-task" class="text-button" hidden>Start a different task</button>
+    <div id="different-confirm" hidden>
+      <p class="field-help">The prior task may still be running. Check Your tasks first. Continue only to prepare a separate task.</p>
+      <button id="confirm-different" class="text-button">Continue with a different task</button>
+      <button id="keep-start" class="text-button">Keep checking this start</button>
+    </div>
     <button id="start-btn" class="primary wide" disabled>Choose an assistant</button>
   </div>
 </section>
@@ -80,7 +89,7 @@
 <!-- Session -->
 <section id="term-view" class="view" hidden>
   <header class="bar">
-    <button class="back" data-go="list" aria-label="Back to sessions">‹</button>
+    <button class="back" data-go="list" aria-label="Back to tasks">‹</button>
     <div class="title">
       <span id="t-name"></span>
       <div class="title-meta"><span id="t-context"></span><span id="t-status" class="pill"></span><span id="connection-state" class="connection" role="status" aria-live="polite"></span></div>
@@ -88,10 +97,11 @@
     <button id="mode-btn" aria-label="Switch to live terminal">Live</button>
     <button id="kill-btn" class="danger">End</button>
   </header>
+  <p id="startup-note" class="field-help startup-note" role="status" hidden></p>
   <div id="reader-tools" class="reader-tools" hidden><span>Conversation</span><button id="answer-start" hidden>↑ Answer start</button></div>
   <div class="stage">
     <p id="reader-state" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
-    <div id="reader" tabindex="0" aria-label="Session output"></div>
+    <div id="reader" tabindex="0" aria-label="Task output"></div>
     <div id="term" hidden></div>
     <button id="to-bottom" class="float" hidden>↓ Latest</button>
     <div id="conn-note" class="note" hidden></div>
@@ -107,7 +117,7 @@
       <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
       <span id="mic-label"></span>
     </button>
-    <button type="button" id="keys-toggle" aria-controls="keys" aria-expanded="false" aria-label="Show terminal keys">Keys</button>
+    <button type="button" id="keys-toggle" aria-controls="keys" aria-expanded="false" aria-label="Show response controls">Controls</button>
     <button id="send-btn" class="primary" type="submit">Send</button>
   </form>
   <p id="delivery" class="delivery" role="status" aria-live="polite" hidden></p>

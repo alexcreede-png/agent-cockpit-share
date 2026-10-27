@@ -17,7 +17,7 @@ request. Read **Security** below before you run it.
 | New task | Choose Grok or Gemini / Antigravity, a project, and an optional first message. Claude, Codex and Terminal remain under More assistants. Choices and draft stay available after a failed start; project loading can be retried in place. |
 | Session | **Read** view (default on phones): the whole scrollback, swipeable, refreshed live, with a "↓ Latest" button. **Live** view: the real terminal, reconnects by itself. Quick keys (Esc, Enter, arrows, Tab, Shift-Tab, Ctrl-C, 1/2/3, y/n). Message box (multi-line is sent as one message). 📎 attach photos, camera shots or files; 🎤 dictate (transcribed on the Mac, lands in the box for review). End (two taps) |
 
-Antigravity uses its selected model, which may be Gemini or another supported model. Its first message is passed through the interactive prompt option. Opening a task confirms terminal creation, not authentication or assistant readiness. If a start is unconfirmed, check Your tasks before retrying. Drafts are kept in this page’s memory and do not survive a full reload. Leaving the task list or app does not end a running terminal; the Mac must remain available.
+Antigravity uses its selected model, which may be Gemini or another supported model. Its first message is passed through the interactive prompt option. Opening a task confirms terminal creation, not authentication or assistant readiness. If a start is unconfirmed, use **Check start** to recover the original request without opening another terminal. Its assistant, project and first message stay locked until the start is confirmed or you explicitly choose a different task. Pending starts are saved in this tab for up to 24 hours; closing the tab may lose recovery. When browser storage is unavailable, the app explains that you must keep the page open. Ordinary unsubmitted drafts and task-message drafts stay in page memory only. Older servers without safe-start support direct you to Your tasks before retrying. Leaving the task list or app does not end a running terminal; the Mac must remain available.
 
 “Sent to terminal” confirms delivery to the CLI; its response appears in the output pane. If delivery is unconfirmed, check the output before retrying to avoid sending twice. First messages support up to 8,000 characters, and session messages up to 20,000 (including attached file paths). Longer messages are rejected rather than shortened, and the draft stays available to edit.
 
@@ -160,6 +160,16 @@ To check the containing dashboard, set `COCKPIT_DASHBOARD_DIST` to its built `di
 directory and run `node scripts/verify-host.cjs` with the same Playwright/browser setup.
 All API and external requests are synthetic fixtures. The check covers a reduced visual viewport,
 viewport panning, an active usage warning, desktop width, and leaving the cockpit route.
+
+## Start recovery for API clients
+
+`GET /api/state` advertises `startRecovery: true`. Upgraded clients may include a fresh random `requestId` (16–128 ASCII letters, digits, `_` or `-`) in `POST /api/sessions`. Keep the exact ID, assistant, project and first message when retrying an unconfirmed start. A successful response includes `{name, requestId, reused}` and confirms only a live terminal.
+
+A changed payload returns `409 START_REQUEST_MISMATCH`; an uncertain or missing terminal returns `409 START_UNCONFIRMED`; a dead terminal returns `409 START_SESSION_ENDED`. Retrying the same reserved request never launches another terminal. Choose a new ID only for an intentional new task. Older clients without an ID retain their original behavior. Keep the private `start-requests` directory with the instance state; its records contain only a planned identity and digest, not prompt text.
+
+`node scripts/verify-delivery.cjs` also loses a real launch response, reloads the phone page, and verifies that explicit Check start returns the same single terminal before exercising message delivery.
+
+`node scripts/verify-starts.cjs` checks actual HTTP response loss, server restart, concurrent retries, payload mismatch and ended tasks against a unique disposable tmux server. It uses synthetic shell tasks and never launches an assistant or reads an existing session.
 
 ## Known limits
 

@@ -9,7 +9,7 @@ const ASSISTANTS = {
   shell: { name: 'Terminal', hint: 'Advanced: opens a command line on your Mac.' },
 };
 const assistantName = (lane) => ASSISTANTS[lane]?.name || lane || 'Assistant';
-const QUICK_KEYS = [['Esc', 'Escape'], ['⏎', 'Enter'], ['↑', 'Up'], ['↓', 'Down'], ['Tab', 'Tab'],
+const QUICK_KEYS = [['Escape', 'Escape'], ['Enter', 'Enter'], ['↑', 'Up'], ['↓', 'Down'], ['Tab', 'Tab'],
   ['⇧Tab', 'BTab'], ['^C', 'C-c'], ['1', '1'], ['2', '2'], ['3', '3'], ['y', 'y'], ['n', 'n'], ['⌫', 'BSpace']];
 const MESSAGE_MAX_CHARS = 20000, PROMPT_MAX_CHARS = 8000;
 const touch = matchMedia('(pointer: coarse)').matches;
@@ -59,12 +59,14 @@ async function api(path, opts = {}) {
   try {
     const res = await fetch(path, { ...opts, signal: controller.signal, headers: { 'Content-Type': 'application/json', ...authHeaders() } });
     if (!res.ok) {
-      const err = (await res.json().catch(() => ({}))).error || res.status;
+      const body = await res.json().catch(() => ({}));
+      const err = body.error || res.status;
       // Only a token the server refused (e.g. revoked) is reported; merely having none yet is not,
       // or the parent would drop the copy it is about to hand back.
       if (err === 'unpaired' && sent) { device.set(''); tellParent({ type: 'cockpit-unpaired' }); }
       const error = new Error(err);
       error.status = res.status;
+      error.code = body.code; error.requestId = body.requestId; error.sessionName = body.name;
       throw error;
     }
     return (res.headers.get('content-type') || '').includes('json') ? await res.json() : await res.text();
@@ -106,11 +108,12 @@ function taskTime(s) {
 function renderTermIdentity(s, name = current) {
   $('#t-name').textContent = displayProject(s) || name;
   $('#t-name').title = s ? `${displayProject(s)} — ${name}` : name;
-  $('#t-name').setAttribute('aria-label', s ? `${displayProject(s)}, session ${name}` : name);
+  $('#t-name').setAttribute('aria-label', s ? displayProject(s) : 'Task');
   $('#t-context').textContent = s ? assistantName(s.lane) : 'Starting task';
   const pill = $('#t-status');
   pill.className = 'pill ' + (s ? s.status : 'idle');
   pill.textContent = s ? STATUS_LABEL[s.status] || s.status : 'starting';
+  $('#keys-toggle').textContent = s?.status === 'needs-you' ? 'Respond' : 'Controls';
 }
 
 function renderList() {
@@ -135,14 +138,14 @@ function renderList() {
     b.querySelector('.pill').className = `pill ${s.status}`;
     b.querySelector('.pill').textContent = STATUS_LABEL[s.status] || s.status;
     b.querySelector('.meta').textContent = `${assistantName(s.lane)} · ${taskTime(s)}`;
-    b.setAttribute('aria-label', `${displayProject(s)}, ${STATUS_LABEL[s.status] || s.status}, ${assistantName(s.lane)}, session ${s.name}`);
+    b.setAttribute('aria-label', `${displayProject(s)}, ${STATUS_LABEL[s.status] || s.status}, ${assistantName(s.lane)}, ${taskTime(s)}`);
     b.title = `${displayProject(s)} — ${s.name}`;
     if (ul.children[index] !== li) ul.insertBefore(li, ul.children[index] || null);
     existing.delete(s.name);
   });
   for (const li of existing.values()) li.remove();
   $('#list-state').hidden = !q || visible.length > 0;
-  $('#list-state').textContent = q && !visible.length ? 'No matching sessions.' : '';
+  $('#list-state').textContent = q && !visible.length ? 'No matching tasks.' : '';
   $('#empty').hidden = state.sessions.length > 0 || !!q;
   const needs = state.sessions.filter((s) => s.status === 'needs-you').length;
   const working = state.sessions.filter((s) => s.status === 'working').length;
@@ -166,8 +169,9 @@ async function refresh() {
   try {
     const next = await api('/api/state');
     const lanesChanged = JSON.stringify(state.lanes) !== JSON.stringify(next.lanes);
+    const recoveryChanged = state.startRecovery !== next.startRecovery;
     state = next;
-    if (activeView === 'new' && lanesChanged) { renderAssistants(); ready(); }
+    if (activeView === 'new' && (lanesChanged || recoveryChanged)) { renderAssistants(); ready(); }
     projectsRoot = state.projectsRoot || '';
     $('#conn').hidden = true;
     renderList();
@@ -210,13 +214,96 @@ $('#pair-form').onsubmit = async (ev) => {
 // ---------- new session ----------
 let pick = { lane: null, project: null }, projects = [], projectsLoading = false, starting = false, projectLoadId = 0;
 let projectsFailed = false;
+// Only one pending launch is kept, in this tab, for at most 24 hours. No device token or
+// terminal/composer data belongs here. A retry always uses this frozen original request.
+const START_KEY = 'cockpit-pending-start-v1', START_MAX_CHARS = 131072, START_MAX_AGE = 24 * 60 * 60 * 1000;
+let pendingStart = null, pendingProblem = '', recoverySaved = false, recoveryNotice = '', draftRevision = 0;
+function validPending(value) {
+  const r = value?.request;
+  return value && Object.keys(value).sort().join(',') === 'created,draft,filter,request,version'
+    && value.version === 1 && Number.isFinite(value.created)
+    && Date.now() - value.created <= START_MAX_AGE && value.created <= Date.now() + 60000
+    && r && Object.keys(r).sort().join(',') === 'lane,project,prompt,requestId'
+    && Object.hasOwn(ASSISTANTS, r.lane) && typeof r.project === 'string'
+    && r.project.startsWith('/') && r.project.length <= 4096 && !/[\x00-\x1f\x7f]/.test(r.project)
+    && typeof r.prompt === 'string' && r.prompt.length <= PROMPT_MAX_CHARS
+    && (r.lane !== 'shell' || r.prompt === '')
+    && typeof r.requestId === 'string' && r.requestId.length >= 16 && r.requestId.length <= 128 && !/[^A-Za-z0-9_-]/.test(r.requestId)
+    && typeof value.draft === 'string' && value.draft.length <= PROMPT_MAX_CHARS
+    && (r.lane === 'shell' || value.draft === r.prompt)
+    && typeof value.filter === 'string' && value.filter.length <= 256;
+}
+function freezePending(value) { Object.freeze(value.request); return Object.freeze(value); }
+function savePending() {
+  recoverySaved = false;
+  try {
+    const raw = JSON.stringify(pendingStart);
+    if (!validPending(pendingStart) || raw.length > START_MAX_CHARS) return;
+    sessionStorage.setItem(START_KEY, raw);
+    recoverySaved = sessionStorage.getItem(START_KEY) === raw;
+  } catch { /* In-memory checking still works; the UI must explain reload limits. */ }
+}
+function removePending() {
+  try { sessionStorage.removeItem(START_KEY); } catch {}
+  recoverySaved = false;
+}
+function restorePending() {
+  try {
+    const raw = sessionStorage.getItem(START_KEY);
+    if (!raw) return;
+    if (raw.length > START_MAX_CHARS) throw new Error('oversized');
+    const value = JSON.parse(raw);
+    if (!validPending(value)) throw new Error('invalid or expired');
+    pendingStart = freezePending(value); recoverySaved = true;
+    pick = { lane: value.request.lane, project: value.request.project };
+    $('#prompt').value = value.draft; $('#project-filter').value = value.filter;
+  } catch {
+    removePending();
+    recoveryNotice = 'Saved start recovery is unavailable or expired. Check Your tasks before starting again.';
+  }
+}
+function recoveryUI() {
+  const pending = !!pendingStart;
+  $('#new-btn').textContent = $('#empty-new-btn').textContent = pending ? 'Check start' : 'New task';
+  $('#pending-list').textContent = pending ? 'A start needs checking. Use Check start to recover it.' : recoveryNotice;
+  $('#pending-list').hidden = !$('#pending-list').textContent;
+  $('#pending-info').textContent = pending
+    ? 'This start is kept unchanged. Check start uses the same request; it won’t open a second terminal. '
+      + (recoverySaved ? 'Saved in this tab for up to 24 hours; closing the tab may lose recovery.' : 'Reload recovery is unavailable. Keep this page open to check this start.')
+    : recoveryNotice;
+  // Capability is required even for a restored request: an older server may ignore its ID.
+  if (pending && state.startRecovery !== true) $('#pending-info').textContent =
+    'This Mac can’t safely check the saved start right now. Check Your tasks or reconnect to the updated Mac. '
+    + (recoverySaved ? 'The original request is kept in this tab.' : 'Keep this page open; reload recovery is unavailable.');
+  $('#start-capability').textContent = !pending && state.startRecovery !== true
+    ? 'Start checks aren’t available on this Mac. If a start is unconfirmed, check Your tasks before trying again.' : '';
+  $('#different-task').hidden = !pending;
+  if (!pending) $('#different-confirm').hidden = true;
+  $('#prompt').disabled = pending || pick.lane === 'shell';
+  $('#project-filter').disabled = pending;
+  for (const container of [$('#lanes'), $('#other-lanes')]) for (const b of container.children) b.disabled = pending;
+  for (const row of $('#projects').children) row.firstElementChild.disabled = pending;
+}
+restorePending();
+$('#prompt').oninput = () => { draftRevision++; };
+$('#different-task').onclick = () => { $('#different-confirm').hidden = false; $('#confirm-different').focus(); };
+$('#keep-start').onclick = () => { $('#different-confirm').hidden = true; $('#different-task').focus(); };
+$('#confirm-different').onclick = () => {
+  if (!pendingStart) return;
+  // An explicit separate task invalidates all callbacks from the old attempt, even in flight.
+  pendingStart = null; pendingProblem = ''; starting = false; draftRevision++; viewEpoch++;
+  removePending(); recoveryNotice = '';
+  $('#new-err').textContent = ''; $('#start-state').textContent = '';
+  renderAssistants(); renderProjects(); ready(); $('#prompt').focus();
+};
+
 function renderAssistants() {
   const buttons = (lanes) => lanes.map((lane) => {
     const b = document.createElement('button');
     b.type = 'button'; b.textContent = assistantName(lane); b.dataset.lane = lane;
     b.className = pick.lane === lane ? 'on' : '';
     b.setAttribute('aria-pressed', String(pick.lane === lane));
-    b.onclick = () => { pick.lane = lane; updateAssistantChoice(); ready(); };
+    b.onclick = () => { if (pendingStart) return; pick.lane = lane; draftRevision++; updateAssistantChoice(); ready(); };
     return b;
   });
   $('#lanes').replaceChildren(...buttons(['grok', 'agy'].filter((l) => state.lanes.includes(l))));
@@ -234,12 +321,12 @@ function updateAssistantChoice() {
     }
   }
   $('#assistant-help').textContent = !state.lanes.length ? 'Assistants haven’t loaded. Checking the connection to your Mac…'
-    : pick.lane && !state.lanes.includes(pick.lane) ? 'This assistant is unavailable. Choose another assistant.'
+    : pick.lane && !state.lanes.includes(pick.lane) ? (pendingStart ? 'This assistant is unavailable. The original start is kept for checking.' : 'This assistant is unavailable. Choose another assistant.')
     : ASSISTANTS[pick.lane]?.hint || 'Choose who you’d like to work with.';
   $('#prompt-help').textContent = pick.lane === 'shell'
     ? 'Terminal opens without sending a first message. Enter commands after it opens.'
     : 'Optional. Leave this blank to open the assistant and write your message there.';
-  $('#prompt').disabled = pick.lane === 'shell'; // Keep an existing assistant draft, but never send it to a shell.
+  $('#prompt').disabled = !!pendingStart || pick.lane === 'shell'; // Keep an existing assistant draft, but never send it to a shell.
 }
 async function loadProjects() {
   const loadId = ++projectLoadId;
@@ -259,6 +346,8 @@ async function loadProjects() {
 }
 $('#new-btn').onclick = () => {
   show('new'); renderAssistants(); ready();
+  $('#new-view .form').scrollTop = 0;
+  if (!starting && !pendingStart) $('#start-state').textContent = '';
   loadProjects(); // Navigation keeps choices, search and draft; it never starts a task.
 };
 $('#empty-new-btn').onclick = () => $('#new-btn').click();
@@ -273,7 +362,8 @@ function renderProjects() {
     b.className = pick.project === p.path ? 'on' : '';
     b.setAttribute('aria-pressed', String(pick.project === p.path));
     b.onclick = () => {
-      pick.project = p.path;
+      if (pendingStart) return;
+      pick.project = p.path; draftRevision++;
       for (const row of $('#projects').children) {
         const button = row.firstElementChild, selected = button.dataset.project === pick.project;
         button.classList.toggle('on', selected); button.setAttribute('aria-pressed', String(selected));
@@ -293,39 +383,78 @@ $('#project-filter').oninput = () => { renderProjects(); ready(); };
 function ready() {
   const selected = projects.find((p) => p.path === pick.project);
   $('#selected-project').textContent = pick.project ? `Selected: ${selected?.label || projectLabel(pick.project)}` : 'No project selected';
-  if (pick.project && !selected && !projectsLoading && !projectsFailed) $('#selected-project').textContent += ' (unavailable — choose another project)';
+  if (pick.project && !selected && !projectsLoading && !projectsFailed) $('#selected-project').textContent += pendingStart
+    ? ' (not currently listed; original start kept)' : ' (unavailable — choose another project)';
   $('#selected-project').classList.toggle('has-selection', !!pick.project);
   const validProject = !!selected && !projectsLoading && !projectsFailed;
-  $('#start-btn').disabled = !!starting || !(state.lanes.includes(pick.lane) && validProject);
-  $('#start-btn').textContent = starting ? `Starting ${assistantName(starting)}…`
+  recoveryUI();
+  $('#start-btn').disabled = !!starting || (pendingStart
+    ? state.startRecovery !== true || ['START_SESSION_ENDED', 'START_REQUEST_MISMATCH', 'START_INVALID_REQUEST_ID'].includes(pendingProblem)
+    : !(state.lanes.includes(pick.lane) && validProject));
+  $('#start-btn').textContent = starting ? (starting.checking ? 'Checking start…' : `Opening ${assistantName(starting.request.lane)}…`) : pendingStart ? 'Check start'
     : pick.lane ? `Open ${assistantName(pick.lane)}` : 'Choose an assistant';
 }
 $('#start-btn').onclick = async () => {
   if (starting || $('#start-btn').disabled) return;
-  if (pick.lane !== 'shell' && $('#prompt').value.length > PROMPT_MAX_CHARS) {
+  if (!pendingStart && pick.lane !== 'shell' && $('#prompt').value.length > PROMPT_MAX_CHARS) {
     $('#new-err').textContent = 'First message is too long. Use 8,000 characters or fewer; your draft is kept.';
     return;
   }
-  const request = { lane: pick.lane, project: pick.project, prompt: pick.lane === 'shell' ? '' : $('#prompt').value };
-  const epoch = viewEpoch;
-  starting = request.lane; ready();
-  $('#start-state').textContent = `Opening ${assistantName(request.lane)} on your Mac. This may take a moment…`;
+  const checking = !!pendingStart;
+  let record = pendingStart;
+  if (!record && state.startRecovery === true) {
+    let requestId;
+    try {
+      const bytes = crypto.getRandomValues(new Uint8Array(24));
+      requestId = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    } catch {
+      $('#new-err').textContent = 'Can’t prepare a safe start in this browser. Your draft is kept. Check Your tasks or reopen the app.';
+      return;
+    }
+    record = freezePending({ version: 1, created: Date.now(), draft: $('#prompt').value,
+      filter: $('#project-filter').value.slice(0, 256), request: {
+        lane: pick.lane, project: pick.project, prompt: pick.lane === 'shell' ? '' : $('#prompt').value, requestId,
+      } });
+    pendingStart = record; pendingProblem = ''; savePending();
+  }
+  const request = record?.request || Object.freeze({ lane: pick.lane, project: pick.project, prompt: pick.lane === 'shell' ? '' : $('#prompt').value });
+  const attempt = { request, record, checking, epoch: viewEpoch, revision: draftRevision };
+  starting = attempt; ready();
+  $('#start-state').textContent = checking ? 'Checking the original start on your Mac…' : `Opening ${assistantName(request.lane)} on your Mac…`;
   $('#new-err').textContent = '';
   try {
-    const { name } = await post('/api/sessions', request);
-    if (request.lane !== 'shell' && $('#prompt').value === request.prompt) $('#prompt').value = '';
-    $('#start-state').textContent = `${assistantName(request.lane)} opened. Find it in Your tasks.`;
+    const result = await post('/api/sessions', request);
+    // A partial/old-server reply cannot establish that this exact request was confirmed.
+    if (!result || typeof result.name !== 'string' || !result.name || (record && result.requestId !== request.requestId)) throw new Error('Unconfirmed start');
+    if (starting !== attempt || (record && pendingStart !== record)) return;
+    if (record) { pendingStart = null; pendingProblem = ''; removePending(); }
+    const sameDraft = draftRevision === attempt.revision && pick.lane === request.lane && pick.project === request.project
+      && $('#prompt').value === request.prompt;
+    if (request.lane !== 'shell' && sameDraft && viewEpoch === attempt.epoch) $('#prompt').value = '';
+    $('#start-state').textContent = 'Terminal created. The assistant may still need setup or sign-in; check its output before sending again.';
+    recoveryNotice = '';
     await refresh();
-    // A late launch must not pull someone out of a different view or task.
-    if (activeView === 'new' && viewEpoch === epoch) {
-      openTerm(name, { name, lane: request.lane, project: request.project, status: 'idle' });
+    // Navigation and an intentionally newer request take priority over a late response.
+    if (activeView === 'new' && viewEpoch === attempt.epoch && starting === attempt) {
+      openTerm(result.name, { name: result.name, lane: request.lane, project: request.project, status: 'idle' }, true);
     }
   } catch (e) {
+    if (starting !== attempt || (record && pendingStart !== record)) return;
     $('#start-state').textContent = '';
-    $('#new-err').textContent = e.status >= 400 && e.status < 500
-      ? 'Could not open this task. Check your assistant and project, then try again. Your choices and message are kept.'
-      : 'Start wasn’t confirmed. Check Your tasks before trying again. Your choices and message are kept.';
-  } finally { starting = false; ready(); }
+    pendingProblem = record ? e.code || '' : '';
+    $('#new-err').textContent = !record
+      ? (e.status >= 400 && e.status < 500
+        ? 'Could not open this task. Check your assistant and project, then try again. Your choices and message are kept.'
+        : 'Start wasn’t confirmed. Check Your tasks before trying again. Your choices and message are kept.')
+      : e.code === 'START_SESSION_ENDED' ? 'This task has ended. Checking won’t restart it. Start a different task only if you intend to begin again.'
+      : e.code === 'START_REQUEST_MISMATCH' ? 'The Mac reports different details for this start. It can’t be checked here. Check Your tasks before starting a different task.'
+      : e.code === 'START_INVALID_REQUEST_ID' ? 'The Mac couldn’t use this start reference. Check Your tasks before starting a different task.'
+      : e.status >= 400 && e.status < 500 && e.code !== 'START_UNCONFIRMED'
+        ? 'Could not open this task. Your original choices and message are kept. Check start again, or choose a different task to change them.'
+        : 'Start wasn’t confirmed. Tap Check start to check the original request. It won’t open a second terminal.';
+  } finally {
+    if (starting === attempt) { starting = false; ready(); }
+  }
 };
 
 // ---------- session view ----------
@@ -347,7 +476,10 @@ const composer = (name) => {
 };
 const activeComposer = () => current ? composer(current) : null;
 
-function openTerm(name, session = state.sessions.find((s) => s.name === name)) {
+function openTerm(name, session = state.sessions.find((s) => s.name === name), justCreated = false) {
+  $('#startup-note').textContent = justCreated
+    ? 'Terminal created. Check the output for setup or sign-in. This doesn’t confirm your first message was accepted.' : '';
+  $('#startup-note').hidden = !justCreated;
   closeTerm();
   show('term');
   current = name;
@@ -408,6 +540,9 @@ function fitSession() {
     if (!el.clientWidth) return;
     const cs = getComputedStyle(el), box = charBox(el);
     cols = Math.floor((el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight)) / box.w);
+    // Grok’s centered startup dialog clips content at phone terminal widths.
+    // Read wraps the captured text; Live still uses the actual terminal geometry.
+    if (state.sessions.find(s => s.name === current)?.lane === 'grok') cols = Math.max(100, cols);
     rows = 60;   // read view scrolls, so rows only set how much of the screen stays "live"
   }
   const key = `${current}:${cols}x${rows}`;
@@ -464,7 +599,14 @@ $('#answer-start').onclick = latestAnswerStart;
 $('#answer-start').addEventListener('pointerdown', e => {
   if (document.activeElement === $('#input')) { e.preventDefault(); latestAnswerStart(); }
 });
-function compactReadHistory(text) {
+function compactReadHistory(text, lane) {
+  // Preserve the request verbatim, removing only centering whitespace from the observed
+  // Grok startup dialog. Never infer a permission or send a response from captured text.
+  if (lane === 'grok' && text.includes('Do you trust the contents of this directory?')
+      && text.includes('Grok Build may run or modify contents')
+      && /Yes, proceed\s+y/.test(text) && /No, quit\s+n/.test(text)) {
+    text = text.split('\n').map(line => line.trimStart()).join('\n');
+  }
   const out = [], blank = [];
   const flush = () => { out.push(...(blank.length >= 4 ? ['', ''] : blank)); blank.length = 0; };
   for (const line of text.replace(/\s+$/, '').split('\n')) {
@@ -498,7 +640,7 @@ async function pullReader() {
   if (name !== current || mode !== 'read' || epoch !== readerEpoch) return;
   const conversation = text && typeof text === 'object' && text.source === 'conversation' && Array.isArray(text.messages) ? text : null;
   const messages = conversation ? conversation.messages : null;
-  text = conversation ? JSON.stringify(messages) : compactReadHistory(typeof text === 'string' ? text : '');
+  text = conversation ? JSON.stringify(messages) : compactReadHistory(typeof text === 'string' ? text : '', state.sessions.find(s => s.name === name)?.lane);
   readerState(text ? 'Output available.' : 'No output yet.');
   const el = $('#reader'), resized = el.clientHeight !== readerHeight;
   readerHeight = el.clientHeight;
@@ -536,7 +678,7 @@ function startReader() {
   $('#answer-start').hidden = true;
   $('#reader-tools').hidden = true;
   $('#reader').textContent = 'Loading…';
-  readerState('Loading session output…', true);
+  readerState('Loading task output…', true);
   fitSession();
   pullReader();
   readTimer = setInterval(pullReader, 1500);
@@ -673,11 +815,19 @@ $('#keys').replaceChildren(...QUICK_KEYS.map(([label, key], index) => {
   b.type = 'button'; b.textContent = label;
   b.setAttribute('aria-label', key === 'Enter' ? 'Submit current terminal input' : key);
   if (index > 3) b.className = 'extra-key';
-  b.onclick = () => {
-    if (current) post(`/api/sessions/${current}/keys`, { key })
-      .then(() => { if (key === 'Enter') delivery('Enter sent to terminal'); setTimeout(pullReader, 300); })
-      .catch((err) => delivery('Key failed: ' + err.message, true));
-    closeShortKeys();
+  b.onclick = async () => {
+    const name = current;
+    if (!name || b.disabled) return;
+    b.disabled = true;
+    try {
+      await post(`/api/sessions/${name}/keys`, { key });
+      if (key === 'Enter') sessionDelivery(name, 'Enter sent to terminal');
+      if (current !== name) return;
+      if (['Enter', 'Escape', 'C-c', 'C-d'].includes(key)) closeShortKeys();
+      setTimeout(pullReader, 300);
+    } catch (err) {
+      sessionDelivery(name, 'Key failed: ' + err.message, true);
+    } finally { b.disabled = false; }
   };
   return b;
 }));
@@ -695,7 +845,7 @@ function closeShortKeys(restoreFocus = true) {
   if (!$('#keys').classList.contains('short-open')) return;
   $('#keys').classList.remove('short-open');
   keysToggle.setAttribute('aria-expanded', 'false');
-  keysToggle.setAttribute('aria-label', 'Show terminal keys');
+  keysToggle.setAttribute('aria-label', 'Show response controls');
   if (restoreFocus) keysToggle.focus();
 }
 keysToggle.onclick = () => {
@@ -703,7 +853,7 @@ keysToggle.onclick = () => {
   else {
     $('#keys').classList.add('short-open');
     keysToggle.setAttribute('aria-expanded', 'true');
-    keysToggle.setAttribute('aria-label', 'Hide terminal keys');
+    keysToggle.setAttribute('aria-label', 'Hide response controls');
     $('#keys button').focus();
   }
 };
@@ -908,7 +1058,7 @@ $('#kill-btn').onclick = async () => {
     if (current === name) show('list');
     composers.delete(name);
   } catch (err) {
-    sessionDelivery(name, 'Could not end session. It may still be running. ' + err.message, true);
+    sessionDelivery(name, 'Could not end task. It may still be running. ' + err.message, true);
   } finally { ending = false; b.disabled = false; disarm(); }
 };
 
@@ -924,6 +1074,7 @@ document.addEventListener('visibilitychange', () => {
 // Framed: send our token to the parent (so it can restore it later), or say hello so it can
 // hand back a token it kept.
 embedReady.then(() => tellParent(device.get() ? { type: 'cockpit-device', token: device.get() } : { type: 'cockpit-hello' }));
+recoveryUI();
 refresh().then(() => {
   $('#mic-btn').hidden = !(state.transcribe && canRecord());
   const h = decodeURIComponent(location.hash.slice(1));

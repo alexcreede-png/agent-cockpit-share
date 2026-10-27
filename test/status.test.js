@@ -66,3 +66,15 @@ Folder settings can run code automatically, even without a model request.
   const result = classify(null, screen, 0, false);
   assert.equal(result.status, 'needs-you');
 });
+
+// Text observed in fresh, owned installed-CLI panes; synthetic paths only.
+test('Grok and Antigravity project trust screens request attention', () => {
+  for (const screen of [
+    'Do you trust the contents of this directory?\n/example/project\nGrok Build may run or modify contents in this directory,',
+    'Do you trust the contents of this project?\nAntigravity CLI requires permission to read, edit, and execute files here.\n> Yes, I trust this folder',
+  ]) {
+    const first = classify(null, screen, 0, false);
+    assert.equal(first.status, 'needs-you');
+    assert.equal(classify(first.tracker, screen, 30000, false).status, 'needs-you');
+  }
+});
