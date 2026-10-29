@@ -72,7 +72,7 @@ function fakeMachine() {
     if (bin !== 'tmux' || args[0] !== '-L' || args[1] !== 'cockpit' || args[2] !== '-f' ||
         args[3] !== path.resolve(__dirname, '../../tmux.conf')) throw new Error('unsafe tmux transport');
     const a = args.slice(4); machine.calls.push(a);
-    Promise.resolve().then(() => execute(a)).then((out) => callback(null, out, ''),
+    Promise.resolve().then(() => execute(a)).then(async out => { await machine.after?.(a, out); return out; }).then((out) => callback(null, out, ''),
       (e) => callback(e, '', e.message));
     return { stdin: { on() {}, end() {} } };
   } };
@@ -81,7 +81,7 @@ function fakeMachine() {
   return machine;
 }
 
-function serverHarness(config, machine, { dropResponse = false, readConversation } = {}) {
+function serverHarness(config, machine, { dropResponse = false, readConversation, voice, dictation } = {}) {
   let handler;
   const server = new EventEmitter(); server.listen = (...args) => args.at(-1)();
   const tmux = machine.loadTmux();
@@ -89,11 +89,13 @@ function serverHarness(config, machine, { dropResponse = false, readConversation
     http: { createServer(fn) { handler = fn; return server; } },
     ws: { WebSocketServer: class {} }, 'node-pty': { spawn() { throw new Error('no real pty'); } },
     './lib/config': { load: () => config }, './lib/tmux': tmux,
+    ...(voice ? { './lib/transcribe': voice } : {}),
+    ...(dictation ? { './lib/dictation': dictation } : {}),
     ...(readConversation ? { './lib/reader': { ...require('../../lib/reader'), createReader: () => readConversation } } : {}),
   }, { setInterval: () => ({ unref() {} }), console: { log() {} } });
   return {
-    async request(body, { url = '/api/sessions', method = 'POST', headers = {} } = {}) {
-      const req = Readable.from([Buffer.from(JSON.stringify(body))]);
+    async request(body, { url = '/api/sessions', method = 'POST', headers = {}, raw } = {}) {
+      const req = Readable.from([raw ?? Buffer.from(JSON.stringify(body))]);
       req.url = url; req.method = method;
       req.headers = { host: '127.0.0.1:9999', origin: 'http://127.0.0.1:9999', ...headers };
       return new Promise((resolve) => {

@@ -32,6 +32,15 @@ tmux.configure({ sessionClosedCommand: config.sessionClosedCommand, uploadsDir: 
 const starts = require('./lib/starts').createStarter({ stateDir: config.stateDir, tmux });
 
 const actions = require('./lib/actions').createActions();
+const dictation = require('./lib/dictation').createDictation({ process: voice.fromRequest });
+const endingTasks = new Map();
+const dictationAdmissions = new Set();
+function cancelTaskDictation(task) {
+  // Invalidate asynchronous lookups as well as already-reserved recordings.
+  // These tokens live only while a request is being admitted, not forever.
+  for (const pending of dictationAdmissions) if (pending.task === task) pending.ended = true;
+  dictation.cancelTask(task);
+}
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -110,6 +119,15 @@ async function requireSession(name) {
   return (await tmux.list()).find((s) => s.name === name) || null;
 }
 
+async function dictationReceipt(id, boot, task) {
+  const receipt = dictation.status(id, boot, task);
+  if (receipt.state === 'pending' || receipt.state === 'complete') {
+    const session = await requireSession(task);
+    if (!session || session.dead || endingTasks.has(task)) throw Object.assign(new Error('original task ended'), { status: 410 });
+  }
+  return dictation.status(id, boot, task); // Re-read after awaiting: discard/End may have won.
+}
+
 async function handle(req, res) {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
@@ -120,7 +138,7 @@ async function handle(req, res) {
   if (req.method === 'GET' && p === '/api/state') {
     const sessions = (await tmux.list()).map((s) => ({ ...s, status: statusOf.get(s.name) || (s.dead ? 'exited' : 'idle') }));
     return send(res, 200, { lanes: Object.keys(tmux.LANES), sessions, notify: NOTIFY, projectsRoot: config.projectsRoot,
-      startRecovery: true, actionEpoch: actions.epoch, transcribe: !!config.transcribeCommand, uploadMaxMB: config.uploadMaxMB });
+      startRecovery: true, actionEpoch: actions.epoch, dictationEpoch: dictation.epoch, transcribe: !!config.transcribeCommand, uploadMaxMB: config.uploadMaxMB });
   }
   if (req.method === 'GET' && p === '/api/projects') return send(res, 200, guard.listProjects(config));
 
@@ -138,18 +156,46 @@ async function handle(req, res) {
 
   if (req.method === 'POST' && p === '/api/transcribe') {
     if (!config.transcribeCommand) return send(res, 404, { error: 'transcription not configured' });
-    const text = await voice.fromRequest(req, { dir: config.uploadsDir, command: config.transcribeCommand, maxBytes: 25 << 20 });
+    const options = { dir: config.uploadsDir, command: config.transcribeCommand, maxBytes: 25 << 20 };
+    if (req.headers['x-dictation-id'] !== undefined || req.headers['x-dictation-epoch'] !== undefined || req.headers['x-dictation-task'] !== undefined) {
+      const id = req.headers['x-dictation-id'], boot = req.headers['x-dictation-epoch'], task = req.headers['x-dictation-task'];
+      const admission = { task, ended: endingTasks.has(task) };
+      dictationAdmissions.add(admission);
+      try {
+        // Retries for terminal jobs remain observable after their task ends.
+        const receipt = await dictationReceipt(id, boot, task);
+        if (receipt.state !== 'unknown') { req.resume(); return send(res, 200, receipt); }
+        const session = await requireSession(task);
+        if (admission.ended || !session || session.dead || endingTasks.has(task)) return send(res, 410, { error: 'original task ended' });
+        dictation.submit(id, boot, task, req, options);
+      } finally {
+        dictationAdmissions.delete(admission);
+      }
+      await dictation.accepted(id);
+      return send(res, 202, await dictationReceipt(id, boot, task));
+    }
+    const text = await dictation.legacy(req, options);
     log('transcribed', text.length, 'chars');
     return send(res, 200, { text });
+  }
+
+  const d = p.match(/^\/api\/transcribe\/([a-f0-9]{32})(\/cancel)?$/);
+  if (d && ((req.method === 'GET' && !d[2]) || (req.method === 'POST' && d[2]))) {
+    const args = [d[1], url.searchParams.get('epoch'), url.searchParams.get('task')];
+    return send(res, 200, d[2] ? dictation.cancel(...args) : await dictationReceipt(...args));
   }
 
   const m = p.match(/^\/api\/sessions\/([^/]+)\/(keys|end|history|upload|size)$/);
   if (m) {
     if (!guard.validSessionName(m[1])) return send(res, 404, { error: 'no such session' });
     const s = await requireSession(m[1]);
-    if (!s) return req.method === 'POST' && m[2] === 'end'
-      ? send(res, 200, { ok: true, absent: true })
-      : send(res, 404, { error: 'no such session' });
+    if (!s) {
+      if (req.method === 'POST' && m[2] === 'end') {
+        cancelTaskDictation(m[1]);
+        return send(res, 200, { ok: true, absent: true });
+      }
+      return send(res, 404, { error: 'no such session' });
+    }
     if (req.method === 'GET' && m[2] === 'history') {
       const lines = Math.min(Math.max(Number(url.searchParams.get('lines')) || 2000, 50), 20000);
       let screen;
@@ -195,9 +241,13 @@ async function handle(req, res) {
       return send(res, 200, { cols, rows });
     }
     if (req.method === 'POST' && m[2] === 'end') {
+      endingTasks.set(s.name, (endingTasks.get(s.name) || 0) + 1); cancelTaskDictation(s.name);
       try { await tmux.kill(s.name); } catch (err) {
         // Another End may have won after our initial existence check.
         if (await requireSession(s.name)) throw err;
+      } finally {
+        const remaining = endingTasks.get(s.name) - 1;
+        remaining ? endingTasks.set(s.name, remaining) : endingTasks.delete(s.name);
       }
       log('ended', s.name);
       return send(res, 200, { ok: true });
@@ -240,7 +290,7 @@ const server = http.createServer((req, res) => {
   handle(req, res).catch((e) => {
     log('error', e.message);
     if (!res.headersSent) send(res, e.status || 500, { error: e.message,
-      ...(typeof e.code === 'string' && (e.code.startsWith('START_') || e.code.startsWith('ACTION_')) ? { code: e.code, requestId: e.requestId, name: e.sessionName } : {}) });
+      ...(typeof e.code === 'string' && (e.code.startsWith('START_') || e.code.startsWith('ACTION_') || e.code.startsWith('DICTATION_')) ? { code: e.code, requestId: e.requestId, name: e.sessionName } : {}) });
   });
 });
 

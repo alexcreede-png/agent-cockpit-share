@@ -199,3 +199,7 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 @media (min-width: 700px) {
   #list-view, #new-view { max-width: 700px; margin-inline: auto; }
 }
+
+/* Recovery stays in one compact scrolling row above the keyboard. */
+.dictation-recovery { gap: 8px; overflow-x: auto; justify-content: flex-start; }
+.dictation-recovery > * { flex: none; white-space: nowrap; }

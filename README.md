@@ -74,14 +74,25 @@ Read view shortens runs of four or more blank terminal rows to two for readabili
 4. On the phone open `https://<publicHost>` and use Share → Add to Home Screen for an app icon.
 
 5. Pair the phone. Open the cockpit **from the Home Screen icon** (iOS keeps its cookies separate
-   from Safari), then on the Mac run:
+   from Safari). On the Mac, open the Agent Cockpit folder in Finder and double-click
+   **Pair-a-phone.command**. Terminal opens and explains the action. Press **Return** to create
+   a code, or type **cancel** and press Return to stop without changing pairing state.
+
+   Enter the code shown in Terminal into **Pairing code** on the phone, then tap **Connect this
+   phone**. Terminal shows the expiry time and waits for Return so you can keep the code visible.
+   Keep Tailscale connected on both devices. Only pair a phone you want to control your Mac.
+
+   The helper uses the existing Node.js installation and `scripts/pair.js` in its own folder;
+   keep it with the complete checkout configured for your running Cockpit. If it cannot find
+   Node.js, it explains how to continue without changing pairing state. Cockpit requires Node.js 22 or newer.
+   Advanced fallback: open Terminal in the Agent Cockpit folder and run:
 
    ```bash
    npm run pair
    ```
 
-   Type the code it prints into the phone. The code works once and expires in 10 minutes; five
-   wrong tries burn it. `npm run pair -- list` shows paired phones and `npm run pair -- revoke <id>`
+   The code works once and expires in 10 minutes; creating a new code replaces the unused one.
+   Five wrong tries burn it. `npm run pair -- list` shows paired phones and `npm run pair -- revoke <id>`
    (or `all`) unpairs them.
 
 To keep it running across reboots, make a LaunchAgent that runs `node server.js` in this folder
@@ -160,6 +171,45 @@ To check the containing dashboard, set `COCKPIT_DASHBOARD_DIST` to its built `di
 directory and run `node scripts/verify-host.cjs` with the same Playwright/browser setup.
 All API and external requests are synthetic fixtures. The check covers a reduced visual viewport,
 viewport panning, an active usage warning, desktop width, and leaving the cockpit route.
+
+## Dictation recovery
+
+Keep the page open after recording. Accepted jobs are checked automatically with read-only requests every two seconds while the page is visible. A network failure stops those checks and offers **Check dictation**, which only reads the original job's status;
+when an upload is unknown, **Retry upload** checks again before uploading the same recording
+with the same identity. A queued job can outlast the browser's 60-second request timeout.
+Recovered words go into the original task's draft for review, never directly to the terminal.
+**Discard dictation** and End suppress late results. A failed or expired job is never restarted
+by a status check or a same-ID upload. Recording controls require a server advertising recovery;
+old clients retain the synchronous `POST /api/transcribe` → `{text}` interface, without retry guarantees.
+
+Audio stays in page memory until completion/discard, for at most 15 minutes after recording,
+with four recordings per page, one per task, up to 25 MiB each. Recording stops after two minutes
+or rejects over-limit audio. These page timers depend on the browser being scheduled; expired
+recordings cannot be recovered by checking after the limit. Reloading, closing the page, browser
+memory eviction or restarting the server has **no supported dictation recovery**. Ordinary
+completed draft text remains page-local under the existing draft lifecycle.
+
+The Mac admits at most four receiving/queued/running jobs, serializes model commands (180 seconds
+each), and aborts jobs after 12 minutes including upload/queue time. It uses the existing private
+`.voice` temporary audio files for processing only, removing them on completion/failure/cancel;
+it adds no audio archive. Completed text is held **only in server memory**, at most 20,000
+characters per result for ten minutes, and is cleared earlier on acknowledged page acceptance,
+discard or task end. Up to 1,024 identities/tombstones are kept per server run; capacity refuses
+new work rather than evicting an identity and risking duplicate execution. Restarting clears
+that registry and changes its epoch. Abrupt process/machine termination can leave existing-style
+temporary files; this protocol does not promise crash cleanup or recovery. Cancellation requests
+are best effort while disconnected; page ownership checks still suppress late text locally.
+
+API clients obtain `dictationEpoch` from paired `GET /api/state`. Upload to `POST /api/transcribe`
+with `X-Dictation-Id` (32 random lowercase hex characters), `X-Dictation-Epoch`, and
+`X-Dictation-Task` (original session name). The server reserves the identity before streaming,
+then acknowledges the fully received upload with a receipt (HTTP 202; repeated uploads may
+return 200). Receipts contain `{requestId, epoch, task, state}` and `text` only when complete.
+`GET /api/transcribe/<id>?epoch=<epoch>&task=<task>` is a non-executing lookup;
+`POST /api/transcribe/<id>/cancel?epoch=<epoch>&task=<task>` cancels/discards that identity,
+including a cancel that arrives before its upload. All routes retain guard and pairing checks.
+A mismatched task returns 409; stale epochs and unavailable original tasks fail closed with 410.
+Use the original epoch/ID on retry; generating another ID has no deduplication guarantee.
 
 ## Start recovery for API clients
 

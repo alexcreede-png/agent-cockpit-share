@@ -73,3 +73,16 @@ test('token can come from header, websocket subprotocol, or cookie', () => {
   assert.equal(pairing.readToken({ headers: { 'x-cockpit-device': 'bad token!' } }), null);
   assert.equal(pairing.readToken({ headers: {} }), null);
 });
+
+test('new dictation upload, status and discard routes remain unreachable without a paired device', async () => {
+  const { fakeMachine, serverHarness } = require('./helpers/start-harness');
+  const config = { stateDir: path.join(ROOT, 'dictation-routes'), port: 9999, allowLocal: true, pairing: true,
+    frameAncestors: [], grokHome: path.join(ROOT, 'unused-provider'), uploadsDir: path.join(ROOT, 'unused-audio') };
+  const server = serverHarness(config, fakeMachine(), { readConversation: async () => null });
+  const id = 'a'.repeat(32), query = '?epoch=synthetic&task=example';
+  for (const [url, method] of [['/api/transcribe', 'POST'], [`/api/transcribe/${id}${query}`, 'GET'], [`/api/transcribe/${id}/cancel${query}`, 'POST']]) {
+    const result = await server.request({}, { url, method });
+    assert.equal(result.status, 401); assert.equal(result.body.error, 'unpaired');
+  }
+  assert.equal(fs.existsSync(config.uploadsDir), false, 'unpaired requests did not create audio files');
+});

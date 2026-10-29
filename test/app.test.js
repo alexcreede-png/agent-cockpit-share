@@ -12,7 +12,7 @@ test('public/app.js compiles as a script', () => {
   assert.doesNotThrow(() => new vm.Script(src, { filename: 'app.js' }));
 });
 
-function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, history = '', terminalHistory, historyError = false, createFlow = false, startRecovery = false, savedStarts = new Map(), storageDenied = false, cryptoDenied = false, requestHook } = {}) {
+function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, dictation = false, history = '', terminalHistory, historyError = false, createFlow = false, startRecovery = false, savedStarts = new Map(), storageDenied = false, cryptoDenied = false, requestHook } = {}) {
   class Element {
     constructor() {
       this.children = []; this.dataset = {}; this.style = {}; this.value = ''; this.hidden = false;
@@ -99,10 +99,10 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
     send(data) { this.sent.push(JSON.parse(data)); }
     close() { this.readyState = 3; }
   }
-  const window = { addEventListener() {}, MediaRecorder: voiceStall || voiceBodyStall ? FakeMediaRecorder : null, visualViewport: null };
+  const window = { addEventListener() {}, MediaRecorder: voiceStall || voiceBodyStall || dictation ? FakeMediaRecorder : null, visualViewport: null };
   window.parent = window;
   const context = vm.createContext({
-    document, window, navigator: voiceStall || voiceBodyStall ? { mediaDevices: { getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }) } } : {},
+    document, window, navigator: voiceStall || voiceBodyStall || dictation ? { mediaDevices: { getUserMedia: async () => { if (setup.micPermission) await setup.micPermission; return { getTracks: () => [{ stop() { setup.micStops = (setup.micStops || 0) + 1; } }] }; } } } : {},
     matchMedia: () => ({ matches: true }), XMLHttpRequest: XHR, MediaRecorder: FakeMediaRecorder, Blob,
     Terminal: FakeTerminal, WebSocket: FakeSocket, FitAddon: { FitAddon: class { fit() {} } },
     AbortController,
@@ -138,7 +138,7 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
         await new Promise(resolve => { setup.finishCreate = resolve; });
       }
       if (path === '/api/sessions' && setup.loseResponse) throw new Error('response lost');
-      const body = path === '/api/state' ? { startRecovery: setup.startRecovery, lanes: createFlow ? ['claude','codex','grok','agy','shell'] : [], sessions: setup.sessions ?? [...new Set(['a','b','synthetic-created',vm.runInContext('current', context)].filter(Boolean))].map(name => ({name,lane:'grok',project:'/example/project',status:'idle'})), actionEpoch: 'synthetic-epoch', transcribe: false }
+      const body = path === '/api/state' ? { startRecovery: setup.startRecovery, lanes: createFlow ? ['claude','codex','grok','agy','shell'] : [], sessions: setup.sessions ?? [...new Set(['a','b','synthetic-created',vm.runInContext('current', context)].filter(Boolean))].map(name => ({name,lane:'grok',project:'/example/project',status:'idle'})), actionEpoch: 'synthetic-epoch', dictationEpoch: 'synthetic-voice-epoch', transcribe: false }
         : path.endsWith('/keys') ? {ok:true,actionId:JSON.parse(opts.body).actionId} : path === '/api/projects' ? exampleProjects : path === '/api/sessions' ? {name:'synthetic-created', ...(setup.badReply ? {} : {requestId: JSON.parse(opts.body).requestId}), reused: false} : {};
       const failed = (setup.projectError && path === '/api/projects') || ((setup.createError || setup.errorCode) && path === '/api/sessions') || (failHistory && path.includes('/history')) || (failSend && path === '/api/sessions/a/keys') || (failEnd && path === '/api/sessions/a/end');
       return { ok: !failed, status: failed ? (path === '/api/sessions' && (setup.errorCode || setup.createError) ? setup.errorStatus : failSendStatus) : 200,
@@ -306,8 +306,9 @@ test('stalled transcription times out without changing the session draft', async
   assert.ok(timer);
   timer.fn(); await tick();
   assert.equal(h.el('#input').value, 'Typed first');
-  assert.equal(h.el('#mic-btn').disabled, false);
+  assert.equal(h.el('#mic-btn').disabled, true, 'recording retained until check or discard');
   assert.match(h.el('#delivery').textContent, /Transcription timed out/);
+  assert.equal(vm.runInContext("dictations.get('a').blob.size", h.context), 15);
 });
 
 test('transcription timeout also covers a stalled response body', async () => {
@@ -320,8 +321,9 @@ test('transcription timeout also covers a stalled response body', async () => {
   const timer = h.timers.find((t) => t.ms === 60000 && !t.canceled);
   assert.ok(timer);
   timer.fn(); await tick();
-  assert.equal(h.el('#mic-btn').disabled, false);
+  assert.equal(h.el('#mic-btn').disabled, true, 'recording retained until check or discard');
   assert.match(h.el('#delivery').textContent, /Transcription timed out/);
+  assert.equal(vm.runInContext("dictations.get('a').blob.size", h.context), 15);
 });
 
 test('failed send retains the draft and failed end keeps the session open', async () => {
@@ -1240,6 +1242,385 @@ test('a state request begun before opening a task cannot settle that newly opene
   assert.equal(h.el('#send-btn').disabled, false);
 });
 
+const jsonResponse = (body, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
+async function recordClip(h) {
+  await h.el('#mic-btn').click(); await h.el('#mic-btn').click(); await tick();
+}
+function voiceReply(call, state, text) {
+  return { requestId: call.opts.headers['X-Dictation-Id'], epoch: call.opts.headers['X-Dictation-Epoch'],
+    task: call.opts.headers['X-Dictation-Task'], state, ...(text !== undefined ? { text } : {}) };
+}
+
+function heldDictationState() {
+  let release;
+  const h = frontend({ dictation: true, requestHook: async (path, opts) => {
+    if (path === '/api/state' && release) {
+      const resume = release;
+      release = null;
+      return new Promise(resume);
+    }
+    if (path === '/api/transcribe') return jsonResponse(voiceReply({ opts }, 'pending'));
+    if (path.includes('/cancel?')) return jsonResponse({ state: 'cancelled' });
+  } });
+  h.holdState = sessions => {
+    let finish;
+    release = resolve => { finish = () => resolve({ ...jsonResponse({
+      sessions, lanes: [], actionEpoch: 'synthetic-epoch', dictationEpoch: 'synthetic-voice-epoch',
+    }), headers: { get: () => 'application/json' } }); };
+    const pending = vm.runInContext('refresh()', h.context);
+    return async () => { assert.ok(finish, 'state request reached the hold'); finish(); await pending; };
+  };
+  return h;
+}
+
+test('state from before task B opened cannot end its newer active or uploaded recording', async () => {
+  for (const uploaded of [false, true]) {
+    const h = heldDictationState(); await tick();
+    vm.runInContext("openTerm('a')", h.context); await tick();
+    const release = h.holdState([{ name: 'a', status: 'idle' }]);
+    vm.runInContext("openTerm('b', { name: 'b', lane: 'grok', status: 'idle' }, true)", h.context);
+    h.el('#input').value = 'B draft'; h.el('#input').oninput();
+    await h.el('#mic-btn').click();
+    if (uploaded) { await h.el('#mic-btn').click(); await tick(); }
+    await release();
+    assert.equal(vm.runInContext("endedTasks.has('b')", h.context), false);
+    assert.equal(h.el('#input').value, 'B draft');
+    assert.equal(h.el('#send-btn').disabled, false);
+    assert.notEqual(h.el('#connection-state').dataset.state, 'ended');
+    assert.equal(h.calls.filter(c => c.path.includes('/cancel?')).length, 0);
+    if (uploaded) assert.equal(vm.runInContext("dictations.get('b').blob.size", h.context), 15);
+    else assert.equal(vm.runInContext("recTask === 'b' && rec.state === 'recording'", h.context), true);
+  }
+});
+
+test('old view response cannot end an existing dictation after reopening the same task', async () => {
+  const h = heldDictationState(); await tick();
+  vm.runInContext("openTerm('a')", h.context); await recordClip(h); await tick();
+  const release = h.holdState([]);
+  vm.runInContext("openTerm('a')", h.context);
+  await release();
+  assert.equal(vm.runInContext("endedTasks.has('a')", h.context), false);
+  assert.equal(vm.runInContext("dictations.get('a').blob.size", h.context), 15);
+  assert.equal(h.calls.filter(c => c.path.includes('/cancel?')).length, 0);
+});
+
+test('state response cannot discard a background dictation created after its request began', async () => {
+  const h = heldDictationState(); await tick();
+  vm.runInContext("openTerm('a')", h.context); await tick();
+  const release = h.holdState([{ name: 'a', status: 'idle' }]);
+  vm.runInContext("openTerm('b')", h.context); await recordClip(h);
+  vm.runInContext("openTerm('c')", h.context);
+  await release();
+  assert.equal(vm.runInContext("endedTasks.has('b')", h.context), false);
+  assert.equal(vm.runInContext("dictations.get('b').blob.size", h.context), 15);
+  assert.equal(vm.runInContext("endedTasks.has('c')", h.context), false);
+  assert.equal(h.calls.filter(c => c.path.includes('/cancel?')).length, 0);
+});
+
+test('authoritative same-view task end still discards active and uploaded recordings', async () => {
+  for (const sessions of [[], [{ name: 'a', dead: true }], [{ name: 'a', status: 'exited' }]]) {
+    for (const uploaded of [false, true]) {
+      const h = heldDictationState(); await tick();
+      vm.runInContext("openTerm('a')", h.context); await tick();
+      // Begin the request before recording: same-view authority must still apply.
+      const release = h.holdState(sessions);
+      h.el('#input').value = 'Kept draft'; h.el('#input').oninput();
+      await h.el('#mic-btn').click();
+      if (uploaded) { await h.el('#mic-btn').click(); await tick(); }
+      await release();
+      assert.equal(vm.runInContext("endedTasks.has('a')", h.context), true);
+      assert.equal(vm.runInContext('rec', h.context), null);
+      assert.equal(vm.runInContext('dictations.size', h.context), 0);
+      assert.equal(h.el('#input').value, 'Kept draft');
+      assert.equal(h.el('#send-btn').disabled, true);
+      assert.equal(h.setup.micStops, 1);
+      assert.equal(h.calls.filter(c => c.path.includes('/cancel?')).length, uploaded ? 1 : 0);
+    }
+  }
+});
+
+test('state request still cleans up its original background dictation across navigation', async () => {
+  const h = heldDictationState(); await tick();
+  vm.runInContext("openTerm('a')", h.context); await recordClip(h); await tick();
+  const release = h.holdState([{ name: 'b', status: 'idle' }]);
+  vm.runInContext("openTerm('b')", h.context);
+  h.el('#input').value = 'Other draft'; h.el('#input').oninput();
+  await release();
+  assert.equal(vm.runInContext("endedTasks.has('a')", h.context), true);
+  assert.equal(vm.runInContext('dictations.size', h.context), 0);
+  assert.equal(vm.runInContext("endedTasks.has('b')", h.context), false);
+  assert.equal(h.el('#input').value, 'Other draft');
+  assert.equal(h.calls.filter(c => c.path.includes('/cancel?')).length, 1);
+});
+
+test('state request cannot discard a replacement background recording for the same task', async () => {
+  const h = heldDictationState(); await tick();
+  vm.runInContext("openTerm('a')", h.context); await recordClip(h); await tick();
+  const originalId = vm.runInContext("dictations.get('a').id", h.context);
+  const release = h.holdState([]);
+  vm.runInContext('cancelDictation.onclick()', h.context);
+  await recordClip(h);
+  vm.runInContext("openTerm('b')", h.context);
+  await release();
+  assert.equal(vm.runInContext("endedTasks.has('a')", h.context), false);
+  assert.notEqual(vm.runInContext("dictations.get('a').id", h.context), originalId);
+  assert.equal(vm.runInContext("dictations.get('a').blob.size", h.context), 15);
+  assert.equal(h.calls.filter(c => c.path.includes('/cancel?')).length, 1, 'only explicit discard cancels');
+});
+
+test('lost upload response keeps audio; read-only checks recover original-task text once without sending', async () => {
+  let upload, ready = false;
+  const h = frontend({ dictation: true, requestHook: async (path, opts) => {
+    if (path === '/api/transcribe') {
+      upload = { path, opts };
+      return new Promise((resolve, reject) => opts.signal.addEventListener('abort', () => reject(new Error('response lost'))));
+    }
+    if (path.startsWith('/api/transcribe/')) return jsonResponse(voiceReply(upload, ready ? 'complete' : 'pending', ready ? 'recovered words' : undefined));
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context);
+  h.el('#input').value = 'Original'; h.el('#input').oninput(); await recordClip(h);
+  h.timers.find(t => t.ms === 60000 && !t.canceled).fn(); await tick();
+  assert.equal(vm.runInContext("dictations.get('a').blob.size", h.context), 15);
+  await vm.runInContext('checkDictation.onclick()', h.context);
+  assert.equal(h.calls.filter(c => c.path === '/api/transcribe').length, 1);
+  assert.equal(h.calls.filter(c => c.path.includes('/api/transcribe/') && c.opts.method === 'GET').length, 1);
+  vm.runInContext("openTerm('b')", h.context);
+  h.el('#input').value = 'Other task'; h.el('#input').oninput();
+  ready = true;
+  // An explicit check made for a keeps ownership even if its response arrives while b is open.
+  await vm.runInContext("requestDictation(dictations.get('a'))", h.context);
+  assert.equal(h.el('#input').value, 'Other task');
+  vm.runInContext("openTerm('a')", h.context);
+  assert.equal(h.el('#input').value, 'Original recovered words');
+  await vm.runInContext('checkDictation.onclick()', h.context);
+  assert.equal(h.el('#input').value, 'Original recovered words');
+  assert.equal(h.calls.filter(c => c.path.endsWith('/keys')).length, 0, 'dictation never sends input');
+  assert.equal(vm.runInContext('dictations.size', h.context), 0);
+  assert.ok(h.calls.some(c => c.path.includes('/cancel?')), 'accepted text is released on server');
+  assert.ok([...h.savedStarts.values()].every(v => !v.includes('recovered words')), 'result not persisted in storage');
+});
+
+test('explicit retry first reads unknown status, then reuses exact original identity/audio', async () => {
+  let reached = false; const uploaded = [];
+  const h = frontend({ dictation: true, requestHook: async (path, opts) => {
+    if (path === '/api/transcribe') {
+      uploaded.push({ path, opts });
+      if (!reached) throw new Error('offline before upload');
+      return jsonResponse(voiceReply(uploaded[0], 'complete', 'same audio recovered'));
+    }
+    if (path.startsWith('/api/transcribe/')) return jsonResponse(voiceReply(uploaded[0], 'unknown'));
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await recordClip(h);
+  assert.equal(uploaded.length, 1);
+  await vm.runInContext('checkDictation.onclick()', h.context);
+  assert.equal(uploaded.length, 1, 'checking unknown never uploads');
+  reached = true;
+  await vm.runInContext('retryDictation.onclick()', h.context);
+  assert.equal(uploaded.length, 2);
+  assert.match(uploaded[0].opts.headers['X-Dictation-Id'], /^[a-f0-9]{32}$/);
+  assert.equal(uploaded[1].opts.headers['X-Dictation-Id'], uploaded[0].opts.headers['X-Dictation-Id']);
+  assert.equal(uploaded[1].opts.body, uploaded[0].opts.body);
+  assert.equal(h.el('#input').value, 'same audio recovered');
+  const actions = h.calls.filter(c => c.path.startsWith('/api/transcribe'));
+  assert.deepEqual(actions.slice(0, 4).map(c => c.opts.method), ['POST', 'GET', 'GET', 'POST']);
+});
+
+test('retry discovers an accepted job and retrieves its result without uploading again', async () => {
+  let original;
+  const h = frontend({ dictation: true, requestHook: async (path, opts) => {
+    if (path === '/api/transcribe') { original = { opts }; throw new Error('lost reply'); }
+    if (path.startsWith('/api/transcribe/')) return jsonResponse(voiceReply(original, 'complete', 'already done'));
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await recordClip(h);
+  // It was previously unknown; retry still reads again before considering a POST.
+  vm.runInContext("dictations.get('a').phase = 'unknown'", h.context);
+  await vm.runInContext('retryDictation.onclick()', h.context);
+  assert.equal(h.calls.filter(c => c.path === '/api/transcribe').length, 1);
+  assert.equal(h.el('#input').value, 'already done');
+});
+
+test('discard during upload suppresses late text and allows a new recording with a new ID', async () => {
+  let finish; const uploaded = [];
+  const h = frontend({ dictation: true, requestHook: async (path, opts) => {
+    if (path === '/api/transcribe') { uploaded.push({ opts }); return new Promise(resolve => { finish = resolve; }); }
+    if (path.includes('/cancel?')) return jsonResponse({ state: 'cancelled' });
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context);
+  h.el('#input').value = 'Keep draft'; h.el('#input').oninput(); await recordClip(h);
+  const oldFinish = finish;
+  vm.runInContext('cancelDictation.onclick()', h.context);
+  assert.equal(uploaded[0].opts.signal.aborted, true);
+  assert.equal(vm.runInContext('dictations.size', h.context), 0);
+  oldFinish(jsonResponse(voiceReply(uploaded[0], 'complete', 'LATE'))); await tick();
+  assert.equal(h.el('#input').value, 'Keep draft');
+  await recordClip(h);
+  assert.notEqual(uploaded[1].opts.headers['X-Dictation-Id'], uploaded[0].opts.headers['X-Dictation-Id']);
+  assert.equal(h.calls.filter(c => c.path.endsWith('/keys')).length, 0);
+  vm.runInContext('cancelDictation.onclick()', h.context);
+  finish(jsonResponse(voiceReply(uploaded[1], 'complete', 'ALSO LATE'))); await tick();
+  assert.equal(h.el('#input').value, 'Keep draft');
+});
+
+test('task end, including unconfirmed End, discards recording and suppresses late completion', async () => {
+  for (const failEnd of [false, true]) {
+    let finish, original;
+    const h = frontend({ dictation: true, failEnd, requestHook: async (path, opts) => {
+      if (path === '/api/transcribe') { original = { opts }; return new Promise(resolve => { finish = resolve; }); }
+      if (path.includes('/cancel?')) return jsonResponse({ state: 'cancelled' });
+    } });
+    await tick(); vm.runInContext("openTerm('a')", h.context);
+    h.el('#input').value = 'Typed'; h.el('#input').oninput(); await recordClip(h);
+    h.el('#kill-btn').click(); await h.el('#kill-btn').click();
+    finish(jsonResponse(voiceReply(original, 'complete', 'late after end'))); await tick();
+    assert.equal(h.el('#input').value, 'Typed');
+    await vm.runInContext('checkDictation.onclick()', h.context);
+    assert.equal(h.calls.filter(c => c.path === '/api/transcribe').length, 1);
+    assert.equal(vm.runInContext('dictations.size', h.context), 0);
+  }
+});
+
+test('missing original task while checking prevents late status text from entering its draft', async () => {
+  let original, finish;
+  const h = frontend({ dictation: true, requestHook: async (path, opts) => {
+    if (path === '/api/transcribe') { original = { opts }; return jsonResponse(voiceReply(original, 'pending')); }
+    if (path.startsWith('/api/transcribe/') && opts.method === 'GET') return new Promise(resolve => { finish = resolve; });
+    if (path.includes('/cancel?')) return jsonResponse({ state: 'cancelled' });
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await recordClip(h);
+  const pending = vm.runInContext('checkDictation.onclick()', h.context); await tick();
+  h.setup.sessions = [{ name: 'b', lane: 'shell', project: '/example' }];
+  await vm.runInContext('refresh()', h.context);
+  finish(jsonResponse(voiceReply(original, 'complete', 'late unavailable task'))); await pending;
+  assert.equal(h.el('#input').value, ''); assert.equal(vm.runInContext('dictations.size', h.context), 0);
+  assert.match(h.el('#delivery').textContent, /ended|unavailable/i);
+});
+
+test('failed, expired, stale-boot and mismatched receipts retain audio without automatic retries or text', async () => {
+  for (const state of ['failed', 'expired', 'stale', 'mismatch']) {
+    const h = frontend({ dictation: true, requestHook: async (path, opts) => {
+      if (path === '/api/transcribe') {
+        if (state === 'stale') return jsonResponse({ error: 'server changed' }, 410);
+        const reply = voiceReply({ opts }, state === 'mismatch' ? 'complete' : state, 'untrusted');
+        if (state === 'mismatch') reply.task = 'b';
+        return jsonResponse(reply);
+      }
+    } });
+    await tick(); vm.runInContext("openTerm('a')", h.context); await recordClip(h);
+    assert.equal(h.el('#input').value, '');
+    assert.equal(vm.runInContext("dictations.get('a').blob.size", h.context), 15);
+    assert.equal(h.calls.filter(c => c.path === '/api/transcribe').length, 1);
+    assert.equal(h.calls.filter(c => c.path.endsWith('/keys')).length, 0);
+    vm.runInContext('cancelDictation.onclick()', h.context);
+  }
+});
+
+test('page retention expires, requests cancellation and frees recording without storing audio/text', async () => {
+  let original;
+  const h = frontend({ dictation: true, requestHook: async (path, opts) => {
+    if (path === '/api/transcribe') { original = { opts }; return jsonResponse(voiceReply(original, 'pending')); }
+    if (path.includes('/cancel?')) return jsonResponse({ state: 'cancelled' });
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await recordClip(h);
+  h.timers.find(t => t.ms === 15 * 60000 && !t.canceled).fn(); await tick();
+  assert.equal(vm.runInContext('dictations.size', h.context), 0);
+  assert.match(h.el('#delivery').textContent, /expired after 15 minutes/);
+  assert.equal(h.calls.filter(c => c.path === '/api/transcribe').length, 1);
+  assert.ok(h.calls.some(c => c.path.includes('/cancel?')));
+  const reloaded = frontend({ dictation: true, savedStarts: h.savedStarts }); await tick();
+  assert.equal(vm.runInContext('dictations.size', reloaded.context), 0);
+  assert.equal(reloaded.calls.filter(c => c.path === '/api/transcribe').length, 0);
+});
+
+test('discard while recording stops it without uploading or appending any text', async () => {
+  const h = frontend({ dictation: true });
+  await tick(); vm.runInContext("openTerm('a')", h.context);
+  h.el('#input').value = 'Keep'; h.el('#input').oninput();
+  await h.el('#mic-btn').click();
+  assert.equal(vm.runInContext('dictationControls.hidden', h.context), false);
+  vm.runInContext('cancelDictation.onclick()', h.context); await tick();
+  assert.equal(h.calls.filter(c => c.path === '/api/transcribe').length, 0);
+  assert.equal(vm.runInContext('rec', h.context), null);
+  assert.equal(vm.runInContext('dictations.size', h.context), 0);
+  assert.equal(h.el('#input').value, 'Keep');
+});
+
+test('background task disappearance discards its recording while leaving the selected task alone', async () => {
+  let finish, original;
+  const h = frontend({ dictation: true, requestHook: async (path, opts) => {
+    if (path === '/api/transcribe') { original = { opts }; return new Promise(resolve => { finish = resolve; }); }
+    if (path.includes('/cancel?')) return jsonResponse({ state: 'cancelled' });
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await recordClip(h);
+  vm.runInContext("openTerm('b')", h.context);
+  h.el('#input').value = 'Other'; h.el('#input').oninput();
+  h.setup.sessions = [{ name: 'b', lane: 'shell', project: '/example' }];
+  await vm.runInContext('refresh()', h.context);
+  finish(jsonResponse(voiceReply(original, 'complete', 'late background text'))); await tick();
+  assert.equal(h.el('#input').value, 'Other');
+  assert.equal(vm.runInContext("composer('a').draft", h.context), '');
+  assert.equal(vm.runInContext('dictations.size', h.context), 0);
+});
+
+test('microphone permission resolving after End or a task switch cannot start abandoned recording', async () => {
+  for (const action of ['end', 'switch']) {
+    const h = frontend({ dictation: true, failEnd: true });
+    await tick(); vm.runInContext("openTerm('a')", h.context);
+    let release; h.setup.micPermission = new Promise(resolve => { release = resolve; });
+    const permission = h.el('#mic-btn').click();
+    if (action === 'end') { h.el('#kill-btn').click(); await h.el('#kill-btn').click(); }
+    else vm.runInContext("openTerm('b'); openTerm('a')", h.context);
+    release(); await permission;
+    assert.equal(vm.runInContext('rec', h.context), null);
+    assert.equal(h.setup.micStops, 1);
+    assert.equal(h.calls.filter(c => c.path === '/api/transcribe').length, 0);
+  }
+});
+
+test('suspended-page expiry rejects a late result even before its cleanup timer has fired', async () => {
+  let original, finish;
+  const h = frontend({ dictation: true, requestHook: async (path, opts) => {
+    if (path === '/api/transcribe') { original = { opts }; return new Promise(resolve => { finish = resolve; }); }
+    if (path.includes('/cancel?')) return jsonResponse({ state: 'cancelled' });
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await recordClip(h);
+  vm.runInContext("dictations.get('a').created -= 15 * 60000 + 1", h.context);
+  finish(jsonResponse(voiceReply(original, 'complete', 'too late'))); await tick();
+  assert.equal(h.el('#input').value, ''); assert.equal(vm.runInContext('dictations.size', h.context), 0);
+  assert.match(h.el('#delivery').textContent, /expired/);
+});
+
+test('four page recordings bound admission; discard frees a slot and a fifth task can record', async () => {
+  let count = 0;
+  const h = frontend({ dictation: true, requestHook: async (path, opts) => {
+    if (path === '/api/transcribe') { count++; return jsonResponse(voiceReply({ opts }, 'pending')); }
+    if (path.includes('/cancel?')) return jsonResponse({ state: 'cancelled' });
+  } });
+  await tick();
+  h.setup.sessions = ['a', 'b', 'c', 'd', 'e'].map(name => ({ name, lane: 'shell', project: '/example' }));
+  for (const name of ['a', 'b', 'c', 'd']) { vm.runInContext(`openTerm('${name}')`, h.context); await recordClip(h); }
+  vm.runInContext("openTerm('e')", h.context); await h.el('#mic-btn').click();
+  assert.equal(count, 4); assert.equal(vm.runInContext('dictations.size', h.context), 4);
+  assert.match(h.el('#delivery').textContent, /Four recordings/);
+  vm.runInContext("discardDictation('a')", h.context); await recordClip(h);
+  assert.equal(count, 5); assert.equal(vm.runInContext('dictations.size', h.context), 4);
+});
+
+test('recording duration and byte bounds stop capture without uploading oversized audio', async () => {
+  let count = 0;
+  const h = frontend({ dictation: true, requestHook: async (path, opts) => {
+    if (path === '/api/transcribe') { count++; return jsonResponse(voiceReply({ opts }, 'pending')); }
+    if (path.includes('/cancel?')) return jsonResponse({ state: 'cancelled' });
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await h.el('#mic-btn').click();
+  h.timers.find(t => t.ms === 120000 && !t.canceled).fn(); await tick();
+  assert.equal(vm.runInContext('rec', h.context), null); assert.equal(count, 1);
+  vm.runInContext('cancelDictation.onclick()', h.context);
+  await h.el('#mic-btn').click();
+  vm.runInContext('rec.ondataavailable({ data: { size: 25 * 1048576 + 1 } })', h.context); await tick();
+  assert.equal(vm.runInContext('rec', h.context), null); assert.equal(count, 1);
+  assert.equal(vm.runInContext('dictations.size', h.context), 0);
+});
+
 test('pairing prevents a second code redemption while the first is pending', async () => {
   let finishPair;
   const h = frontend({ requestHook: async (path) => {
@@ -1275,4 +1656,59 @@ test('pairing distinguishes uncertain transport from rejected codes and forbidde
     assert.equal(h.calls.filter(c => c.path === '/api/pair').length, 1);
     assert.equal(h.el('#pair-submit').disabled, false);
   }
+});
+
+test('accepted dictation completes through read-only polling without another upload or send', async () => {
+  let original, checks = 0;
+  const h = frontend({ dictation: true, requestHook: async (path, opts) => {
+    if (path === '/api/transcribe') { original = { opts }; return jsonResponse(voiceReply(original, 'pending')); }
+    if (path.includes('/cancel?')) return jsonResponse({state:'cancelled'});
+    if (path.startsWith('/api/transcribe/')) {
+      checks++; return jsonResponse(voiceReply(original, checks < 2 ? 'pending' : 'complete', checks < 2 ? undefined : 'Automatic result'));
+    }
+  }});
+  await tick(); vm.runInContext("openTerm('a')",h.context); await recordClip(h);
+  h.el('#input').value = 'Original'; h.el('#input').oninput();
+  vm.runInContext("openTerm('b')",h.context);
+  h.el('#input').value = 'Other task'; h.el('#input').oninput();
+  for (let i=0;i<2;i++) {
+    const timer = h.timers.find(t=>t.ms===2000&&!t.canceled); assert.ok(timer);
+    await timer.fn(); await tick();
+  }
+  assert.equal(h.el('#input').value,'Other task');
+  assert.equal(vm.runInContext("composer('a').draft",h.context),'Original Automatic result');
+  assert.equal(h.calls.filter(c=>c.path==='/api/transcribe').length,1);
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length,0);
+  assert.equal(h.timers.some(t=>t.ms===2000&&!t.canceled),false);
+});
+
+test('poll transport failure stops automatic checks and discard cancels pending checks', async () => {
+  let original;
+  const h = frontend({dictation:true,requestHook:async(path,opts)=>{
+    if(path==='/api/transcribe'){original={opts};return jsonResponse(voiceReply(original,'pending'));}
+    if(path.includes('/cancel?'))return jsonResponse({state:'cancelled'});
+    if(path.startsWith('/api/transcribe/'))throw new Error('lost response');
+  }});
+  await tick();vm.runInContext("openTerm('a')",h.context);await recordClip(h);
+  await h.timers.find(t=>t.ms===2000&&!t.canceled).fn();await tick();
+  assert.equal(h.timers.some(t=>t.ms===2000&&!t.canceled),false);
+  assert.equal(vm.runInContext("dictations.get('a').phase",h.context),'unconfirmed');
+  assert.equal(vm.runInContext('checkDictation.hidden',h.context),false);
+  assert.equal(h.calls.filter(c=>c.path==='/api/transcribe').length,1);
+  vm.runInContext("dictations.get('a').phase='pending';scheduleDictationCheck(dictations.get('a'))",h.context);
+  const timer=h.timers.find(t=>t.ms===2000&&!t.canceled);assert.ok(timer);
+  vm.runInContext('cancelDictation.onclick()',h.context);await tick();
+  assert.equal(timer.canceled,true);
+  const count=h.calls.length;await timer.fn();assert.equal(h.calls.length,count);
+});
+
+test('permanent dictation capacity gives a restart action instead of an endless check loop', async () => {
+  const h=frontend({dictation:true,requestHook:async(path)=>path==='/api/transcribe'
+    ?jsonResponse({error:'recovery full',code:'DICTATION_CAPACITY'},503):undefined});
+  await tick();vm.runInContext("openTerm('a')",h.context);await recordClip(h);
+  assert.match(h.el('#delivery').textContent,/restart Cockpit/);
+  assert.doesNotMatch(h.el('#delivery').textContent,/check status|Check dictation/);
+  assert.equal(vm.runInContext('checkDictation.hidden',h.context),true);
+  assert.equal(vm.runInContext('retryDictation.hidden',h.context),true);
+  assert.equal(h.calls.filter(c=>c.path==='/api/transcribe').length,1);
 });

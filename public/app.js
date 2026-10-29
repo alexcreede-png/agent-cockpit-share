@@ -169,11 +169,19 @@ async function refresh() {
   if (refreshBusy) return;
   refreshBusy = true;
   const viewed = current, epoch = viewEpoch;
+  const requestedDictations = new Map(dictations);
   try {
     const next = await api('/api/state');
     const lanesChanged = JSON.stringify(state.lanes) !== JSON.stringify(next.lanes);
     const recoveryChanged = state.startRecovery !== next.startRecovery;
     state = next;
+    // This response can only settle background recordings it was requested for.
+    // The current task is reconciled below through the view-generation guard.
+    for (const [name, recording] of requestedDictations) {
+      if (name === current || dictations.get(name) !== recording) continue;
+      const task = state.sessions.find(s => s.name === name);
+      if (!task || task.dead || task.status === 'exited') settleTask(name);
+    }
     if (activeView === 'new' && (lanesChanged || recoveryChanged)) { renderAssistants(); ready(); }
     projectsRoot = state.projectsRoot || '';
     $('#conn').hidden = true;
@@ -560,13 +568,14 @@ function renderTaskControls() {
   $('#send-btn').disabled = blocked || sending.has(current);
   $('#send-btn').textContent = sending.has(current) ? 'Sending…' : 'Send';
   for (const id of ['#kill-btn', '#mode-btn', '#keys-toggle', '#startup-respond', '#attach-btn']) $(id).disabled = ended;
-  $('#mic-btn').disabled = ended || $('#mic-btn').classList.contains('busy');
+  $('#mic-btn').disabled = ended || ending || dictations.has(current) || $('#mic-btn').classList.contains('busy');
   recoveryControls.hidden = checkDelivery.hidden = reviewDelivery.hidden = !a.uncertain || ended;
   checkDelivery.hidden = checkDelivery.hidden || !a.uncertain?.request;
   checkDelivery.disabled = reviewDelivery.disabled = !!a.checking;
 }
 function settleTask(name) {
   endedTasks.add(name);
+  discardDictation(name);
   try { saveActionMarker(name, false); } catch { /* The settled task remains disabled. */ }
   const a = actionState(name); a.generation++;
   if (current !== name) return;
@@ -672,6 +681,7 @@ function openTerm(name, session = state.sessions.find((s) => s.name === name), j
   history.replaceState(null, '', '#' + name);
   renderTermIdentity(session, name);
   micState('idle');
+  renderDictation();
   const c = composer(name);
   $('#input').value = c.draft;
   grow();
@@ -687,6 +697,7 @@ function openTerm(name, session = state.sessions.find((s) => s.name === name), j
 }
 
 function closeTerm() {
+  micGeneration++;
   if (current) composer(current).draft = $('#input').value;
   current = null;
   closeShortKeys(false);
@@ -1192,63 +1203,177 @@ function renderPending() {
   }));
 }
 
-// --- dictation: record on the phone, transcribe on the Mac, drop the text in the box to review
-const TRANSCRIBE_TIMEOUT_MS = 60000;
-let rec = null, recStart = 0, recTick = null, requestingMic = false;
+// --- Dictation recovery lives only in this page. Status polling never re-uploads audio.
+const TRANSCRIBE_TIMEOUT_MS = 60000, DICTATION_PAGE_MS = 15 * 60000, DICTATION_POLL_MS = 2000;
+const dictations = new Map();
+let rec = null, recTask = null, recStart = 0, recTick = null, requestingMic = false, micGeneration = 0;
 const canRecord = () => !!(window.MediaRecorder && navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+const dictationControls = document.createElement('div');
+dictationControls.className = 'reader-tools dictation-recovery'; dictationControls.hidden = true;
+const dictationLabel = document.createElement('span');
+const checkDictation = document.createElement('button'), retryDictation = document.createElement('button'), cancelDictation = document.createElement('button');
+for (const [button, label] of [[checkDictation, 'Check dictation'], [retryDictation, 'Retry upload'], [cancelDictation, 'Discard dictation']]) {
+  button.type = 'button'; button.className = 'text-button'; button.textContent = label;
+}
+dictationControls.append(dictationLabel, checkDictation, retryDictation, cancelDictation);
+$('#term-view').append(dictationControls);
+function renderDictation() {
+  const d = dictations.get(current), recording = rec && recTask === current;
+  dictationControls.hidden = !d && !recording;
+  dictationLabel.textContent = recording ? 'Recording…' : d ? (d.phase === 'pending' ? 'Converting recording…'
+    : d.busy ? 'Checking recording…' : d.phase === 'unknown' ? 'Ready to retry' : 'Recording needs attention') : '';
+  dictationLabel.setAttribute('aria-label', d?.message || 'Dictation recovery');
+  checkDictation.hidden = !d || ['pending', 'failed', 'expired', 'cancelled', 'unavailable'].includes(d.phase);
+  retryDictation.hidden = !d || d.phase !== 'unknown';
+  checkDictation.disabled = retryDictation.disabled = !!d?.busy;
+  cancelDictation.disabled = false;
+  micState(rec && recTask === current ? 'rec' : d?.busy ? 'busy' : 'idle');
+  $('#mic-btn').disabled = !!d || ending || endedTasks.has(current);
+}
+function dictationPath(d) {
+  return `/api/transcribe/${d.id}?epoch=${encodeURIComponent(d.epoch)}&task=${encodeURIComponent(d.name)}`;
+}
+function ownsDictation(d) { return dictations.get(d.name) === d && !endedTasks.has(d.name); }
+function scheduleDictationCheck(d) {
+  clearTimeout(d.poll);
+  if (!ownsDictation(d) || d.phase !== 'pending' || document.hidden) return;
+  d.poll = setTimeout(() => requestDictation(d), DICTATION_POLL_MS);
+}
+function expirePageDictation(d) {
+  if (!ownsDictation(d)) return false;
+  if (Date.now() - d.created < DICTATION_PAGE_MS) return false;
+  discardDictation(d.name); sessionDelivery(d.name, 'Page recording expired after 15 minutes. Recovery is unavailable.', true);
+  return true;
+}
+function acceptDictation(d, receipt) {
+  if (!ownsDictation(d) || expirePageDictation(d)) return;
+  if (receipt?.requestId !== d.id || receipt.epoch !== d.epoch || receipt.task !== d.name) throw new Error('Dictation receipt did not match this recording.');
+  if (!['unknown', 'pending', 'complete', 'failed', 'expired', 'cancelled'].includes(receipt.state)) throw new Error('Unrecognized dictation status.');
+  d.phase = receipt.state;
+  if (receipt.state === 'complete') {
+    if (typeof receipt.text !== 'string' || receipt.text.length > MESSAGE_MAX_CHARS) throw new Error('Invalid dictation result.');
+    const c = composer(d.name);
+    c.draft = (c.draft.trim() ? c.draft.trim() + ' ' : '') + receipt.text;
+    if (current === d.name) { $('#input').value = c.draft; grow(); }
+    clearTimeout(d.expiry); clearTimeout(d.poll); d.blob = null; dictations.delete(d.name);
+    // Remove the bounded result from the Mac once it is safely in the page draft.
+    post(dictationPath(d).replace('?', '/cancel?')).catch(() => {});
+    sessionDelivery(d.name, receipt.text ? 'Dictation added to draft. Review before Send.' : 'Didn’t catch anything.');
+    return;
+  }
+  d.message = receipt.state === 'pending' ? 'Turning your recording into text. Keep this page open.'
+    : receipt.state === 'unknown' ? 'The Mac has not received this recording. Retry upload to send it again.'
+    : receipt.state === 'failed' ? 'The recording could not be converted. Discard it, then record again.'
+    : receipt.state === 'expired' ? 'This recording expired. Discard it, then record again.'
+    : 'This recording was cancelled. Discard it to record again.';
+  sessionDelivery(d.name, d.message, receipt.state !== 'pending');
+}
+async function requestDictation(d, upload = false) {
+  if (!ownsDictation(d) || d.busy || expirePageDictation(d)) return;
+  clearTimeout(d.poll);
+  d.busy = true; const controller = new AbortController(); d.controller = controller;
+  const timer = setTimeout(() => controller.abort(), TRANSCRIBE_TIMEOUT_MS);
+  if (current === d.name) renderDictation();
+  try {
+    const response = await fetch(upload ? '/api/transcribe' : dictationPath(d), {
+      method: upload ? 'POST' : 'GET', signal: controller.signal,
+      headers: { ...authHeaders(), ...(upload ? { 'Content-Type': d.blob.type,
+        'X-Dictation-Id': d.id, 'X-Dictation-Epoch': d.epoch, 'X-Dictation-Task': d.name } : {}) },
+      ...(upload ? { body: d.blob } : {}),
+    });
+    const receipt = await response.json();
+    if (!response.ok) {
+      const error = new Error(receipt.error || `HTTP ${response.status}`); error.status = response.status; error.code = receipt.code; throw error;
+    }
+    acceptDictation(d, receipt);
+  } catch (err) {
+    if (!ownsDictation(d)) return;
+    d.phase = err.code === 'DICTATION_CAPACITY' ? 'unavailable' : [400, 409, 410, 413].includes(err.status) ? 'failed' : 'unconfirmed';
+    d.message = d.phase === 'unavailable' ? 'Dictation recovery is full. Discard this recording and restart Cockpit on your Mac before recording again.'
+      : d.phase === 'failed' ? (err.status === 410 ? 'This recording is no longer available. Discard it, then refresh before recording again.'
+        : err.status === 413 ? 'This recording is too large. Discard it and record a shorter message.'
+        : 'This recording could not be accepted. Discard it, then refresh before recording again.')
+      : controller.signal.aborted ? 'Transcription timed out. Recording kept; use Check dictation to recover it.'
+      : 'Couldn’t confirm dictation. Recording kept; use Check dictation to recover it.';
+    sessionDelivery(d.name, d.message, true);
+  } finally {
+    clearTimeout(timer); d.busy = false;
+    scheduleDictationCheck(d);
+    if (current === d.name) renderDictation();
+  }
+}
+checkDictation.onclick = () => { const d = dictations.get(current); if (d) return requestDictation(d); };
+retryDictation.onclick = async () => {
+  const d = dictations.get(current);
+  if (!d || d.phase !== 'unknown' || d.busy) return;
+  await requestDictation(d); // A read first: a lost upload response may already have a job.
+  if (ownsDictation(d) && d.phase === 'unknown') return requestDictation(d, true);
+};
+function discardDictation(name) {
+  micGeneration++;
+  if (rec && recTask === name) { rec.discarded = true; if (rec.state === 'recording') rec.stop(); }
+  const d = dictations.get(name);
+  if (d) {
+    dictations.delete(name); d.blob = null; clearTimeout(d.expiry); clearTimeout(d.poll); d.controller?.abort();
+    post(dictationPath(d).replace('?', '/cancel?')).catch(() => {});
+  }
+  if (current === name) renderDictation();
+}
+cancelDictation.onclick = () => {
+  const name = current; discardDictation(name);
+  if (name) sessionDelivery(name, 'Dictation discarded. Late text will not be added.');
+};
 $('#mic-btn').onclick = async () => {
   if (rec) { if (rec.state === 'recording') rec.stop(); return; }
   const name = current;
-  if (!name || requestingMic || endedTasks.has(name)) return;
+  if (!name || requestingMic || ending || endedTasks.has(name) || dictations.has(name)) return;
+  if (!state.dictationEpoch) return sessionDelivery(name, 'Dictation recovery unavailable. Refresh before recording.', true);
+  if (dictations.size >= 4) return sessionDelivery(name, 'Four recordings are already kept on this page. Check or discard one first.', true);
+  let id;
+  try { const bytes = new Uint8Array(16); crypto.getRandomValues(bytes); id = Array.from(bytes, x => x.toString(16).padStart(2, '0')).join(''); }
+  catch { return sessionDelivery(name, 'Safe dictation identity unavailable. Recording not started.', true); }
+  const epoch = state.dictationEpoch, generation = micGeneration;
   requestingMic = true;
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
   catch { if (current === name) flash('Microphone blocked. Allow it for this site in Safari settings.'); return; }
   finally { requestingMic = false; }
-  if (current !== name || endedTasks.has(name)) { stream.getTracks().forEach((t) => t.stop()); return; }
+  if (current !== name || endedTasks.has(name) || ending || generation !== micGeneration) { stream.getTracks().forEach((t) => t.stop()); return; }
   const type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].find((t) => MediaRecorder.isTypeSupported(t)) || '';
-  const r = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
-  const chunks = [];
-  r.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
-  r.onstop = async () => {
-    stream.getTracks().forEach((t) => t.stop());
-    clearInterval(recTick);
-    rec = null;
-    const blob = new Blob(chunks, { type: (r.mimeType || type || 'audio/mp4').split(';')[0] });
-    if (!blob.size) { if (current === name) micState('idle'); return; }
-    if (current === name) micState('busy');
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), TRANSCRIBE_TIMEOUT_MS);
-    try {
-      const res = await fetch('/api/transcribe', { method: 'POST', signal: controller.signal,
-        headers: { 'Content-Type': blob.type, ...authHeaders() }, body: blob });
-      const b = await res.json().catch((err) => { if (controller.signal.aborted) throw err; return {}; });
-      if (!res.ok) throw new Error(b.error || `HTTP ${res.status}`);
-      if (b.text) {
-        const c = composer(name);
-        c.draft = (c.draft.trim() ? c.draft.trim() + ' ' : '') + b.text;
-        if (current === name) { $('#input').value = c.draft; grow(); }
-      } else if (current === name) flash('Didn’t catch anything');
-    } catch (err) {
-      const message = controller.signal.aborted ? 'Transcription timed out. Try again.' : 'Transcription failed: ' + err.message;
-      sessionDelivery(name, message, true);
-      if (current === name) flash(message);
-    } finally {
-      clearTimeout(timeout);
-      if (current === name) micState('idle');
-    }
+  let r;
+  try { r = new MediaRecorder(stream, type ? { mimeType: type } : undefined); }
+  catch { stream.getTracks().forEach(t => t.stop()); return sessionDelivery(name, 'Recording unavailable.', true); }
+  const chunks = []; let bytes = 0;
+  r.ondataavailable = (e) => {
+    bytes += e.data.size;
+    if (bytes > 25 * 1048576) { r.discarded = true; chunks.length = 0; if (r.state === 'recording') r.stop(); }
+    else if (e.data.size && !r.discarded) chunks.push(e.data);
   };
-  rec = r;
-  r.start();
-  recStart = Date.now();
-  micState('rec');
-  recTick = setInterval(() => micState('rec'), 500);
+  const recordingTimer = setTimeout(() => { if (r.state === 'recording') r.stop(); }, 120000);
+  r.onstop = () => {
+    stream.getTracks().forEach((t) => t.stop()); clearTimeout(recordingTimer); clearInterval(recTick);
+    rec = null; recTask = null;
+    if (r.discarded || endedTasks.has(name)) { chunks.length = 0; if (current === name) renderDictation(); return; }
+    const blob = new Blob(chunks, { type: (r.mimeType || type || 'audio/mp4').split(';')[0] }); chunks.length = 0;
+    if (!blob.size) { if (current === name) renderDictation(); return; }
+    const d = { id, epoch, name, blob, created: Date.now(), phase: 'unconfirmed', busy: false };
+    dictations.set(name, d);
+    d.expiry = setTimeout(() => {
+      if (!ownsDictation(d)) return;
+      discardDictation(name); sessionDelivery(name, 'Page recording expired after 15 minutes. Recovery is unavailable.', true);
+    }, DICTATION_PAGE_MS);
+    requestDictation(d, true);
+  };
+  rec = r; recTask = name;
+  try { r.start(1000); }
+  catch { r.discarded = true; stream.getTracks().forEach(t => t.stop()); clearTimeout(recordingTimer); rec = null; recTask = null; return sessionDelivery(name, 'Recording could not start.', true); }
+  recStart = Date.now(); renderDictation(); recTick = setInterval(() => micState('rec'), 500);
 };
 function micState(s) {
   const b = $('#mic-btn');
   b.classList.toggle('rec', s === 'rec');
   b.classList.toggle('busy', s === 'busy');
-  b.disabled = s === 'busy' || endedTasks.has(current);
+  b.disabled = s === 'busy' || ending || endedTasks.has(current);
   const secs = Math.floor((Date.now() - recStart) / 1000);
   $('#mic-label').textContent = s === 'rec' ? `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}` : s === 'busy' ? '…' : '';
   b.setAttribute('aria-label', s === 'rec' ? 'Stop and transcribe' : 'Dictate');
@@ -1264,6 +1389,7 @@ $('#kill-btn').onclick = async () => {
   if (!b.classList.contains('armed')) { b.classList.add('armed'); b.textContent = 'Tap to end'; armTimer = setTimeout(disarm, 3000); return; }
   disarm();
   const name = current;
+  discardDictation(name);
   ending = true; b.disabled = true; b.textContent = 'Ending…';
   try {
     await post(`/api/sessions/${name}/end`);
@@ -1281,6 +1407,7 @@ $('#kill-btn').onclick = async () => {
 pollTimer = setInterval(refresh, 3000);
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) return;
+  for (const d of dictations.values()) if (d.phase === 'pending') requestDictation(d);
   refresh();
   if (!current || endedTasks.has(current)) return;
   if (mode === 'live' && (!ws || ws.readyState > 1)) { clearTimeout(wsTimer); wsRetry = 0; connect(current); }
