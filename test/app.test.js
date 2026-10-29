@@ -12,7 +12,7 @@ test('public/app.js compiles as a script', () => {
   assert.doesNotThrow(() => new vm.Script(src, { filename: 'app.js' }));
 });
 
-function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, dictation = false, history = '', terminalHistory, historyError = false, createFlow = false, startRecovery = false, savedStarts = new Map(), storageDenied = false, cryptoDenied = false, requestHook } = {}) {
+function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, dictation = false, history = '', terminalHistory, historyError = false, createFlow = false, startRecovery = false, savedStarts = new Map(), storageDenied = false, cryptoDenied = false, requestHook, initialHash = '' } = {}) {
   class Element {
     constructor() {
       this.children = []; this.dataset = {}; this.style = {}; this.value = ''; this.hidden = false;
@@ -99,8 +99,17 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
     send(data) { this.sent.push(JSON.parse(data)); }
     close() { this.readyState = 3; }
   }
-  const window = { addEventListener() {}, MediaRecorder: voiceStall || voiceBodyStall || dictation ? FakeMediaRecorder : null, visualViewport: null };
+  const windowEvents = new Map();
+  const window = { addEventListener(type, fn) { const listeners = windowEvents.get(type) || []; listeners.push(fn); windowEvents.set(type, listeners); }, MediaRecorder: voiceStall || voiceBodyStall || dictation ? FakeMediaRecorder : null, visualViewport: null };
   window.parent = window;
+  const location = { hash: initialHash, protocol: 'https:', host: 'example.test' };
+  const routeHistory = [initialHash]; let routeIndex = 0;
+  const navHistory = {
+    replaceState(state, title, hash) { routeHistory[routeIndex] = location.hash = hash; },
+    pushState(state, title, hash) { routeHistory.splice(++routeIndex); routeHistory.push(location.hash = hash); },
+    back() { if (routeIndex > 0) { location.hash = routeHistory[--routeIndex]; for (const fn of windowEvents.get('popstate') || []) fn(); } },
+    forward() { if (routeIndex < routeHistory.length - 1) { location.hash = routeHistory[++routeIndex]; for (const fn of windowEvents.get('popstate') || []) fn(); } },
+  };
   const context = vm.createContext({
     document, window, navigator: voiceStall || voiceBodyStall || dictation ? { mediaDevices: { getUserMedia: async () => { if (setup.micPermission) await setup.micPermission; return { getTracks: () => [{ stop() { setup.micStops = (setup.micStops || 0) + 1; } }] }; } } } : {},
     matchMedia: () => ({ matches: true }), XMLHttpRequest: XHR, MediaRecorder: FakeMediaRecorder, Blob,
@@ -112,7 +121,7 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
       setItem: (k,v) => { if (storageDenied) throw new Error('denied'); savedStarts.set(k,v); },
       removeItem: k => { if (storageDenied) throw new Error('denied'); savedStarts.delete(k); },
     },
-    location: { hash: '', protocol: 'https:', host: 'example.test' }, history: { replaceState() {} },
+    location, history: navHistory,
     localStorage: { getItem: () => null, setItem() {} }, ResizeObserver: class {
       constructor(fn) { this.fn = fn; observers.push(this); }
       observe(element) { this.element = element; }
@@ -917,7 +926,7 @@ test('Needs you preserves the raw setup question and opens Respond controls only
   const h=frontend({history:question}); await tick(); openNewAssistant(h); await tick();
   h.el('#dismiss-startup').click();
   const before=h.calls.filter(c=>c.path.endsWith('/keys')).length;
-  vm.runInContext("renderTermIdentity({name:'a',lane:'agy',status:'needs-you'})",h.context);
+  vm.runInContext("renderTermIdentity({name:'a',lane:'agy',status:'needs-you'})",h.context); await tick();
   assert.equal(h.el('#startup-note').hidden,false,'generic dismissal cannot suppress attention guidance');
   assert.equal(h.el('#dismiss-startup').hidden,true);
   assert.equal(h.el('#startup-respond').hidden,false);
@@ -963,7 +972,7 @@ test('output labels follow Read/Live and selected-task guards ignore old source 
 test('Respond navigation stays open; Enter closes only after success and rejected keys remain retryable', async () => {
   for (const failSend of [false,true]) {
     const h=frontend({failSend,failSendStatus:400,history:'A setup question'}); await tick(); openNewAssistant(h); await tick();
-    vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'needs-you'})",h.context);
+    vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'needs-you'})",h.context); await tick();
     h.el('#startup-respond').click();
     const up=h.el('#keys').children.find(b=>b.textContent==='↑');
     const navigation=up.click(); await tick(); h.finishSend(); await navigation;
@@ -987,14 +996,14 @@ test('Needs you shows the current raw question even when an owned conversation a
   await tick(); openNewAssistant(h); await tick();
   assert.equal(h.el('#startup-note').hidden,true);
   assert.equal(h.el('#output-source').textContent,'Conversation');
-  vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'needs-you'})",h.context);
+  vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'needs-you'})",h.context); await tick();
   await vm.runInContext('pullReader()',h.context);
   assert.equal(h.el('#reader').textContent,question);
   assert.equal(h.el('#output-source').textContent,'Terminal output');
   assert.equal(h.el('#answer-start').hidden,true);
   assert.equal(h.el('#startup-note').hidden,false);
   assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length,0);
-  vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'working'})",h.context);
+  vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'working'})",h.context); await tick();
   await vm.runInContext('pullReader()',h.context);
   assert.equal(h.el('#output-source').textContent,'Conversation');
   assert.equal(h.el('#reader').querySelectorAll('.message').length,2);
@@ -1008,9 +1017,9 @@ test('a conversation response from before Needs you cannot replace the current q
   let finishOld;
   h.context.fetch=async (path,opts)=>path.includes('format=reader') ? new Promise(resolve=>{finishOld=resolve;}) : fetch(path,opts);
   const oldPull=vm.runInContext('pullReader()',h.context); await tick();
-  vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'needs-you'})",h.context);
+  vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'needs-you'})",h.context); await tick();
   finishOld({ok:true,headers:{get:()=> 'application/json'},json:async()=> ownedConversation(shownMessages)}); await oldPull;
-  assert.equal(h.el('#reader').textContent,'Earlier output');
+  assert.equal(h.el('#reader').textContent,question, 'raw read proceeds independently of the old conversation');
   await vm.runInContext('pullReader()',h.context);
   assert.equal(h.el('#reader').textContent,question);
   assert.equal(h.el('#output-source').textContent,'Terminal output');
@@ -1128,7 +1137,8 @@ test('lost End response then confirmed absence settles, preserves draft/output a
   assert.equal(h.el('#send-btn').disabled, true); assert.equal(keyButton(h, 'Enter').disabled, true);
   assert.equal(h.el('#kill-btn').disabled, true); assert.equal(h.el('#mode-btn').disabled, true);
   assert.doesNotMatch(h.el('#delivery').textContent, /still be running|Retrying/);
-  assert.match(h.el('#conn-note').textContent, /Use Back/);
+  assert.equal(h.el('#conn-note').hidden, true, 'ended notice does not cover retained output');
+  assert.match(h.el('#delivery').textContent, /Your draft is kept/);
   const count = h.calls.length;
   await vm.runInContext('pullReader(); connect(current); fitSession()', h.context);
   await keyButton(h, 'Enter').click(); await h.el('#kill-btn').click();
@@ -1711,4 +1721,321 @@ test('permanent dictation capacity gives a restart action instead of an endless 
   assert.equal(vm.runInContext('checkDictation.hidden',h.context),true);
   assert.equal(vm.runInContext('retryDictation.hidden',h.context),true);
   assert.equal(h.calls.filter(c=>c.path==='/api/transcribe').length,1);
+});
+
+
+test('Done and repeated Respond close response controls without sending terminal input', async () => {
+  const h=frontend({history:'An assistant question'}); await tick(); openNewAssistant(h); await tick();
+  vm.runInContext("renderTermIdentity({name:'a',lane:'agy',status:'needs-you'})",h.context); await tick();
+  const before=h.calls.filter(c=>c.path.endsWith('/keys')).length;
+  h.el('#input').value='Keep this draft'; h.el('#input').oninput();
+  h.el('#startup-respond').click();
+  const done=h.el('#keys').querySelector('.controls-heading').children.find(b=>b.textContent==='Done');
+  assert.equal(h.context.document.activeElement,done,'phone panel opens on a non-sending control');
+  done.click();
+  assert.equal(h.el('#keys').classList.contains('short-open'),false);
+  assert.equal(h.el('#startup-respond')['aria-expanded'],'false');
+  assert.equal(h.context.document.activeElement,h.el('#startup-respond'));
+  h.el('#startup-respond').click(); h.el('#startup-respond').click();
+  assert.equal(h.el('#keys').classList.contains('short-open'),false);
+  assert.equal(h.el('#keys-toggle')['aria-expanded'],'false');
+  assert.equal(h.el('#input').value,'Keep this draft');
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length,before);
+  h.el('#keys-toggle').click(); done.click();
+  assert.equal(h.context.document.activeElement,h.el('#keys-toggle'));
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length,before);
+});
+
+
+test('browser Back and Forward restore list, new-task draft and the correct task without sending input', async () => {
+  const h=frontend({createFlow:true,startRecovery:true}); await tick();
+  assert.equal(h.context.location.hash,'#');
+  h.el('#new-btn').click(); await tick();
+  h.el('#prompt').value='A first-message draft'; h.el('#prompt').oninput();
+  assert.equal(h.context.location.hash,'#@new');
+  vm.runInContext("openTerm('a')",h.context); await tick();
+  h.el('#input').value='Draft for A'; h.el('#input').oninput();
+  vm.runInContext("openTerm('b')",h.context); await tick();
+  h.el('#input').value='Draft for B'; h.el('#input').oninput();
+  h.context.history.back(); await tick();
+  assert.equal(vm.runInContext('current',h.context),'a');
+  assert.equal(h.el('#input').value,'Draft for A');
+  h.context.history.back(); await tick();
+  assert.equal(vm.runInContext('activeView',h.context),'new');
+  assert.equal(h.el('#prompt').value,'A first-message draft');
+  h.context.history.back(); await tick();
+  assert.equal(vm.runInContext('activeView',h.context),'list');
+  assert.equal(vm.runInContext('current',h.context),null);
+  h.context.history.forward(); h.context.history.forward(); h.context.history.forward(); await tick();
+  assert.equal(vm.runInContext('current',h.context),'b');
+  assert.equal(h.el('#input').value,'Draft for B');
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/keys') || (c.path==='/api/sessions' && c.opts.method==='POST')).length,0);
+});
+
+test('malformed and unavailable task fragments return to list; pairing cannot be navigated around', async () => {
+  const h=frontend(); await tick();
+  for (const hash of ['#%broken','#missing']) {
+    h.context.location.hash=hash; vm.runInContext('restoreRoute()',h.context); await tick();
+    assert.equal(vm.runInContext('activeView',h.context),'list');
+    assert.equal(h.context.location.hash,'#');
+  }
+  vm.runInContext("show('pair')",h.context);
+  h.context.location.hash='#a'; vm.runInContext('restoreRoute()',h.context);
+  assert.equal(vm.runInContext('activeView',h.context),'pair');
+  assert.equal(vm.runInContext('current',h.context),null);
+});
+
+const loadedRouteState = () => ({ok:true,headers:{get:()=> 'application/json'},json:async()=>({lanes:['grok'],sessions:[{name:'a',lane:'grok',project:'/example/project',status:'idle'}],actionEpoch:'synthetic-epoch'})});
+
+test('Back preserves a task destination until delayed initial state arrives', async () => {
+  let resolveInitial, held=true;
+  const h=frontend({initialHash:'#a',requestHook:(path)=>{
+    if(path==='/api/state'&&held){held=false;return new Promise(resolve=>{resolveInitial=resolve;});}
+  }});
+  await tick(); h.el('#new-btn').click(); await tick();
+  h.el('#prompt').value='Keep the new-task draft';h.el('#prompt').oninput();
+  h.context.history.back();
+  assert.equal(h.context.location.hash,'#a');
+  assert.equal(vm.runInContext('current',h.context),null);
+  resolveInitial(loadedRouteState()); await tick(); await tick();
+  assert.equal(vm.runInContext('current',h.context),'a');
+  assert.equal(h.context.location.hash,'#a');
+  assert.equal(h.el('#prompt').value,'Keep the new-task draft');
+});
+
+test('failed initial state keeps a deep link for retry without overriding newer navigation', async () => {
+  for (const navigate of [false,true]) {
+    let fail=true;
+    const h=frontend({initialHash:'#a',requestHook:(path)=>{
+      if(path==='/api/state'&&fail)return Promise.reject(new Error('offline'));
+    }});
+    await tick(); await tick();
+    assert.equal(h.context.location.hash,'#a');
+    assert.equal(vm.runInContext('current',h.context),null);
+    if(navigate)h.el('#new-btn').click();
+    fail=false;await vm.runInContext('refresh()',h.context);await tick();
+    assert.equal(vm.runInContext('activeView',h.context),navigate?'new':'term');
+    assert.equal(h.context.location.hash,navigate?'#@new':'#a');
+    assert.equal(vm.runInContext('current',h.context),navigate?null:'a');
+  }
+});
+
+
+test('reopening an ended task never attributes another task output in Read or Live', async () => {
+  for (const selectedMode of ['read', 'live']) {
+    const h = frontend({ history: 'Output owned by A' }); await tick();
+    vm.runInContext(`openTerm('a'); setMode('${selectedMode}')`, h.context); await tick();
+    if (selectedMode === 'live') {
+      const sock = h.sockets.at(-1); sock.readyState = 1; sock.onopen(); sock.onmessage({data:'Live output owned by A'});
+    }
+    h.setup.sessions = [{name:'a',lane:'grok',status:'exited'},{name:'b',lane:'grok',status:'idle'}];
+    await vm.runInContext('refresh()', h.context);
+    h.setHistory('Output owned by B');
+    vm.runInContext("openTerm('b')", h.context); await tick();
+    if (selectedMode === 'live') {
+      const sock = h.sockets.at(-1); sock.readyState = 1; sock.onopen(); sock.onmessage({data:'Live output owned by B'});
+    }
+    const before = h.calls.filter(c => c.path.includes('/a/history')).length;
+    vm.runInContext("openTerm('a')", h.context); await tick();
+    assert.equal(h.el('#reader').hidden, false, 'ended reopen has a visible truthful output state');
+    assert.match(h.el('#reader').textContent, /No output retained/);
+    assert.doesNotMatch(h.el('#reader').textContent, /owned by B/);
+    assert.equal(h.el('#term').hidden, true);
+    assert.equal(h.el('#term').children.length, 0);
+    assert.equal(h.calls.filter(c => c.path.includes('/a/history')).length, before, 'ended tasks are not retried');
+    assert.equal(h.el('#send-btn').disabled, true);
+  }
+});
+
+test('held older conversation cannot block current raw question or enable unseen response keys', async () => {
+  let holdOld = false, finishOld, finishQuestion;
+  const h = frontend({history:ownedConversation(shownMessages), requestHook: async url => {
+    if (holdOld && url.includes('/history')) return new Promise(resolve => {
+      if (url.includes('format=reader')) finishOld = resolve; else finishQuestion = resolve;
+    });
+  }});
+  await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+  holdOld = true;
+  const oldRead = vm.runInContext('pullReader()', h.context); await tick();
+  vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'needs-you'})", h.context); await tick();
+  assert.equal(typeof finishQuestion, 'function', 'raw question starts without waiting for the older conversation');
+  assert.equal(keyButton(h,'Enter').disabled, true);
+  assert.equal(h.el('#send-btn').disabled, true);
+  h.el('#startup-respond').click(); await keyButton(h,'Enter').click();
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length, 0);
+  finishOld({ok:true,headers:{get:()=> 'application/json'},json:async()=>ownedConversation(shownMessages)});
+  await oldRead;
+  assert.equal(keyButton(h,'Enter').disabled, true, 'stale conversation does not establish readiness');
+  finishQuestion({ok:true,headers:{get:()=> 'text/plain'},text:async()=> 'Current raw question: choose an option'}); await tick();
+  assert.equal(h.el('#reader').textContent, 'Current raw question: choose an option');
+  assert.equal(keyButton(h,'Enter').disabled, false);
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length, 0, 'loading output never sends');
+});
+
+test('attention read failures, empty captures and conversation replies keep every input path blocked until raw output recovers', async () => {
+  const h = frontend({history:'Initial answer'}); await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+  h.setup.sessions = [{name:'a',lane:'grok',status:'needs-you'}];
+  h.setHistoryError(true); await vm.runInContext('refresh()', h.context); await tick();
+  const assertBlocked = async () => {
+    assert.equal(keyButton(h,'Enter').disabled, true);
+    assert.equal(h.el('#send-btn').disabled, true);
+    assert.equal(h.el('#startup-respond').disabled, true);
+    h.el('#input').value = 'Keep this unsent'; h.el('#input').oninput();
+    h.el('#startup-respond').click(); await keyButton(h,'Enter').click();
+    await h.el('#input-row').onsubmit({preventDefault(){}});
+    assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length, 0);
+    assert.equal(h.el('#input').value, 'Keep this unsent');
+  };
+  await assertBlocked(); h.setHistoryError(false);
+  for (const invalid of ['', '   \n', ownedConversation(shownMessages)]) {
+    h.setHistory(invalid); await vm.runInContext('pullReader()', h.context); await assertBlocked();
+  }
+  h.setHistory('Raw current question'); await vm.runInContext('pullReader()', h.context);
+  assert.equal(keyButton(h,'Enter').disabled, false);
+  h.setHistoryError(true); await vm.runInContext('pullReader()', h.context);
+  assert.equal(h.el('#reader').textContent, 'Raw current question', 'last capture may remain visible on failure');
+  await assertBlocked();
+  h.setHistoryError(false); await vm.runInContext('pullReader()', h.context);
+  assert.equal(keyButton(h,'Enter').disabled, false, 'same-text successful recovery establishes readiness again');
+});
+
+test('mode changes and task navigation invalidate question reads, queued keys and Live stdin', async () => {
+  const reads = []; let hold = false;
+  const h = frontend({history:'Initial answer', requestHook: async url => {
+    if (hold && url.includes('/history')) return new Promise(resolve => reads.push({url, resolve}));
+  }});
+  await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+  h.setup.sessions = [{name:'a',lane:'grok',status:'needs-you'},{name:'b',lane:'grok',status:'idle'}];
+  hold = true; await vm.runInContext('refresh()', h.context); await tick();
+  const reply = (read, text) => read.resolve({ok:true,headers:{get:()=> 'text/plain'},text:async()=>text});
+  const first = reads.at(-1);
+  vm.runInContext("setMode('live')", h.context);
+  const sock=h.sockets.at(-1), terminal=h.terminals.at(-1); sock.readyState=1; sock.onopen();
+  const sent=sock.sent.length; terminal.input('\r');
+  assert.equal(sock.sent.length, sent, 'Live Enter cannot bypass unread question');
+  reply(first, 'Stale before Live'); await tick();
+  assert.equal(keyButton(h,'Enter').disabled,true);
+  h.el('#startup-respond').click(); await tick();
+  assert.equal(h.el('#reader').hidden,false,'Respond in Live loads Read first');
+  assert.equal(keyButton(h,'Enter').disabled,true);
+  reply(reads.at(-1), 'Current question A'); await tick();
+  assert.equal(h.el('#reader').textContent,'Current question A');
+  const queued = vm.runInContext("enqueueAction('a', {key:'Enter'}); setMode('live')", h.context);
+  await queued; await tick();
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length,0,'mode change cancels an undispatched queued response');
+  vm.runInContext("setMode('read')",h.context); await tick(); const beforeNavigation=reads.at(-1);
+  vm.runInContext("openTerm('b'); openTerm('a')",h.context); await tick(); const afterNavigation=reads.at(-1);
+  reply(beforeNavigation,'Stale before navigation'); await tick();
+  assert.equal(keyButton(h,'Enter').disabled,true);
+  assert.doesNotMatch(h.el('#reader').textContent,/Stale before navigation/);
+  reply(afterNavigation,'Reopened current question A'); await tick();
+  assert.equal(h.el('#reader').textContent,'Reopened current question A');
+  assert.equal(keyButton(h,'Enter').disabled,false);
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length,0);
+});
+
+test('uncertain delivery checks and manual review cannot bypass a pending current-question read', async () => {
+  let hold = false, finishQuestion;
+  const h = frontend({history:'Current question', requestHook: async (url,opts) => {
+    if (hold && url.includes('/history')) return new Promise(resolve=>{finishQuestion=resolve;});
+    if (url.endsWith('/keys')) {
+      const body=JSON.parse(opts.body);
+      if (!body.check) { hold=true; throw new Error('lost acknowledgement'); }
+      return {ok:true,headers:{get:()=> 'application/json'},json:async()=>({ok:true,actionId:body.actionId})};
+    }
+  }});
+  await tick(); vm.runInContext("openTerm('a')",h.context); await tick();
+  h.setup.sessions=[{name:'a',lane:'grok',status:'needs-you'}];
+  await vm.runInContext('refresh()',h.context); await tick();
+  h.el('#startup-respond').click(); await keyButton(h,'Enter').click(); await tick();
+  assert.equal(vm.runInContext("!!actionState('a').uncertain",h.context),true);
+  assert.equal(vm.runInContext('reviewDelivery.disabled',h.context),true);
+  vm.runInContext('reviewDelivery.onclick()',h.context);
+  assert.equal(vm.runInContext("!!actionState('a').uncertain",h.context),true,'manual review cannot acknowledge unseen output');
+  await vm.runInContext('checkDelivery.onclick()',h.context);
+  assert.equal(vm.runInContext("!!actionState('a').uncertain",h.context),false);
+  assert.equal(keyButton(h,'Enter').disabled,true,'receipt proves delivery only, never question readiness');
+  finishQuestion({ok:true,headers:{get:()=> 'text/plain'},text:async()=> 'Question after uncertain action'}); await tick();
+  assert.equal(h.el('#reader').textContent,'Question after uncertain action');
+  assert.equal(keyButton(h,'Enter').disabled,false);
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')&&!JSON.parse(c.opts.body).check).length,1,'no automatic repeat');
+});
+
+test('leaving and reentering attention invalidates queued responses and older raw captures', async () => {
+  let hold = false; const reads=[];
+  const h=frontend({history:'Initial answer',requestHook:async url=> {
+    if (hold && url.includes('/history')) return new Promise(resolve=>reads.push(resolve));
+  }});
+  await tick(); vm.runInContext("openTerm('a')",h.context); await tick();
+  h.setup.sessions=[{name:'a',lane:'grok',status:'needs-you'}];
+  h.setHistory('First question'); await vm.runInContext('refresh()',h.context); await tick();
+  assert.equal(keyButton(h,'Enter').disabled,false);
+  hold=true;
+  const oldRead=vm.runInContext('pullReader()',h.context); await tick(); const old=reads.at(-1);
+  vm.runInContext("enqueueAction('a',{key:'Enter'}); renderTermIdentity({name:'a',lane:'grok',status:'working'})",h.context);
+  await tick(); assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length,0,'attention ending cancels a queued response');
+  vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'needs-you'})",h.context); await tick(); const fresh=reads.at(-1);
+  old({ok:true,headers:{get:()=> 'text/plain'},text:async()=> 'Old raw question'}); await oldRead;
+  assert.equal(keyButton(h,'Enter').disabled,true);
+  assert.doesNotMatch(h.el('#reader').textContent,/Old raw question/);
+  fresh({ok:true,headers:{get:()=> 'text/plain'},text:async()=> 'New raw question'}); await tick();
+  assert.equal(h.el('#reader').textContent,'New raw question');
+  assert.equal(keyButton(h,'Enter').disabled,false);
+});
+
+test('first opening a task already reported ended shows no retained output and starts no reader or socket', async () => {
+  for (const selectedMode of ['read','live']) {
+    const h=frontend({history:'Other task output'}); await tick();
+    vm.runInContext(`openTerm('b'); setMode('${selectedMode}')`,h.context); await tick();
+    h.setup.sessions=[{name:'a',lane:'grok',status:'exited'},{name:'b',lane:'grok',status:'idle'}];
+    await vm.runInContext('refresh()',h.context);
+    const sockets=h.sockets.length;
+    vm.runInContext("openTerm('a')",h.context); await tick();
+    assert.equal(h.calls.filter(c=>c.path.includes('/a/history')).length,0);
+    assert.equal(h.sockets.length,sockets);
+    assert.match(h.el('#reader').textContent,/No output retained/);
+    assert.equal(h.el('#reader').hidden,false);
+    assert.equal(h.el('#term').hidden,true);
+  }
+});
+
+test('confirmed new task survives Back and Forward while task-state refresh fails or predates the start', async () => {
+  for (const scenario of ['failed', 'older']) {
+    let stateMode = 'normal', releaseOld;
+    const h = await setupTask({startRecovery:true,requestHook:(path)=>{
+      if(path !== '/api/state') return;
+      if(stateMode === 'failed') return Promise.reject(new Error('offline'));
+      if(stateMode === 'hold') return new Promise(resolve=>{releaseOld=resolve;});
+    }});
+    h.setup.sessions = [{name:'a',lane:'grok',status:'idle'}];
+    await vm.runInContext('refresh()',h.context);
+    let older;
+    if(scenario === 'older') {stateMode='hold';older=vm.runInContext('refresh()',h.context);await tick();}
+    else stateMode='failed';
+    await h.el('#start-btn').click();await tick();
+    assert.equal(vm.runInContext('current',h.context),'synthetic-created');
+    h.el('#input').value='New task draft';h.el('#input').oninput();
+    h.context.history.back();h.context.history.forward();await tick();
+    assert.equal(h.context.location.hash,'#synthetic-created');
+    assert.equal(vm.runInContext('current',h.context),'synthetic-created');
+    assert.equal(h.el('#input').value,'New task draft');
+    if(scenario === 'older') {
+      stateMode='failed';releaseOld(loadedRouteState());await older;await tick();
+      assert.equal(vm.runInContext("endedTasks.has('synthetic-created')",h.context),false,'a snapshot begun before confirmation cannot end the task');
+      h.context.history.back();h.context.history.forward();await tick();
+      assert.equal(vm.runInContext('current',h.context),'synthetic-created');
+    }
+    stateMode='normal';h.setup.sessions=[{name:'synthetic-created',lane:'grok',project:'/example/alpha',status:'idle'}];
+    await vm.runInContext('refresh()',h.context);await tick();
+    assert.equal(h.context.location.hash,'#synthetic-created');
+    assert.equal(vm.runInContext('current',h.context),'synthetic-created');
+    assert.equal(startCalls(h).length,1);
+    assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length,0);
+    // A later successful absence is authoritative; confirmed starts are not immortal.
+    h.setup.sessions=[];await vm.runInContext('refresh()',h.context);
+    assert.equal(vm.runInContext("endedTasks.has('synthetic-created')",h.context),true);
+    h.context.history.back();h.context.history.forward();await tick();
+    assert.equal(vm.runInContext('activeView',h.context),'list');
+    assert.equal(h.context.location.hash,'#');
+  }
 });

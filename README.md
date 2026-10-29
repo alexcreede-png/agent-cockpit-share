@@ -23,6 +23,8 @@ Antigravity uses its selected model, which may be Gemini or another supported mo
 
 Read view shortens runs of four or more blank terminal rows to two for readability. Live view preserves the terminal display.
 
+Browser Back and Forward move between tasks and the new-task screen while preserving drafts in the open page. **Done** closes response controls without sending a key. When a task needs an answer, **Respond** opens its current question in Read view; input stays disabled until that question loads. If a task ends while open, its displayed output stays visible until you leave. Reopening an ended task shows that no output was retained. Drafts are not saved across page reloads.
+
 ## Requirements
 
 - macOS (Linux likely works; untested), Node 22+, tmux 3.2+.

@@ -15,6 +15,9 @@ const MESSAGE_MAX_CHARS = 20000, PROMPT_MAX_CHARS = 8000;
 const touch = matchMedia('(pointer: coarse)').matches;
 
 let state = { lanes: [], sessions: [] };
+let stateLoaded = false, pendingRoute = null;
+// Positive start receipts outlive a stale list, until a newer state request validates them.
+const confirmedStarts = new Map();
 let current = null;          // session name open in the terminal view
 let term, fit, ws, pollTimer;
 
@@ -77,11 +80,17 @@ async function api(path, opts = {}) {
 const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body || {}) });
 
 let activeView = 'list', viewEpoch = 0;
-function show(view) {
+function routeURL(view, name, replace = false) {
+  const hash = view === 'new' ? '#@new' : view === 'term' ? '#' + encodeURIComponent(name) : '#';
+  if (location.hash !== hash) history[replace ? 'replaceState' : 'pushState'](null, '', hash);
+}
+function show(view, recordHistory = true, preserveURL = false) {
+  pendingRoute = null;
   activeView = view; viewEpoch++;
   for (const v of ['list', 'new', 'term', 'pair']) $(`#${v}-view`).hidden = v !== view;
   if (view !== 'term') closeTerm();
-  if (view === 'list') { history.replaceState(null, '', '#'); refresh(); }
+  if (!preserveURL && (view === 'list' || view === 'new')) routeURL(view, null, !recordHistory);
+  if (view === 'list') refresh();
 }
 document.querySelectorAll('[data-go]').forEach((b) => b.onclick = () => show(b.dataset.go));
 
@@ -113,8 +122,17 @@ function renderTermIdentity(s, name = current) {
   const pill = $('#t-status');
   pill.className = 'pill ' + (s ? s.status : 'idle');
   pill.textContent = s ? STATUS_LABEL[s.status] || s.status : 'starting';
+  const attentionChanged = needsResponse !== (s?.status === 'needs-you');
   needsResponse = s?.status === 'needs-you';
   $('#keys-toggle').textContent = needsResponse ? 'Respond' : 'Controls';
+  if (attentionChanged && current) {
+    const wasReading = mode === 'read' && (readTimer !== null || readerBusy);
+    actionState(current).generation++; // Cancel responses queued for the previous attention state.
+    stopReader(); // A previous conversation/question cannot own this attention state.
+    closeShortKeys(false);
+    if (wasReading) startReader();
+    renderTaskControls();
+  }
   renderStartupHelp();
 }
 
@@ -170,11 +188,18 @@ async function refresh() {
   refreshBusy = true;
   const viewed = current, epoch = viewEpoch;
   const requestedDictations = new Map(dictations);
+  const requestedStarts = new Map(confirmedStarts);
   try {
     const next = await api('/api/state');
     const lanesChanged = JSON.stringify(state.lanes) !== JSON.stringify(next.lanes);
     const recoveryChanged = state.startRecovery !== next.startRecovery;
-    state = next;
+    for (const [name, session] of requestedStarts) {
+      if (confirmedStarts.get(name) === session) confirmedStarts.delete(name);
+    }
+    state = { ...next, sessions: [...next.sessions] }; stateLoaded = true;
+    for (const [name, session] of confirmedStarts) {
+      if (!state.sessions.some(s => s.name === name)) state.sessions.push(session);
+    }
     // This response can only settle background recordings it was requested for.
     // The current task is reconciled below through the view-generation guard.
     for (const [name, recording] of requestedDictations) {
@@ -192,6 +217,8 @@ async function refresh() {
       if (!s || s.dead || s.status === 'exited') settleTask(current);
       else if (!endedTasks.has(current)) renderTermIdentity(s);
     }
+    const deferred = pendingRoute; pendingRoute = null;
+    if (deferred && deferred.hash === location.hash && deferred.epoch === viewEpoch) restoreRoute();
   } catch (e) {
     if (e.message === 'unpaired') {
       // Framed: the parent may still be handing back a token it kept; don't flash the pair screen.
@@ -367,12 +394,13 @@ async function loadProjects() {
     renderProjects(); ready();
   }
 }
-$('#new-btn').onclick = () => {
-  show('new'); renderAssistants(); ready();
+function openNewTask(recordHistory = true) {
+  show('new', recordHistory); renderAssistants(); ready();
   $('#new-view .form').scrollTop = 0;
   if (!starting && !pendingStart) $('#start-state').textContent = '';
   loadProjects(); // Navigation keeps choices, search and draft; it never starts a task.
-};
+}
+$('#new-btn').onclick = () => openNewTask();
 $('#empty-new-btn').onclick = () => $('#new-btn').click();
 $('#retry-projects').onclick = loadProjects;
 function renderProjects() {
@@ -456,6 +484,9 @@ $('#start-btn').onclick = async () => {
     if (request.lane !== 'shell' && sameDraft && viewEpoch === attempt.epoch) $('#prompt').value = '';
     $('#start-state').textContent = 'Task opened.';
     recoveryNotice = '';
+    const confirmed = { name: result.name, lane: request.lane, project: request.project, status: 'idle', created: Date.now() };
+    confirmedStarts.set(result.name, confirmed);
+    if (!state.sessions.some(s => s.name === result.name)) state.sessions = [...state.sessions, confirmed];
     await refresh();
     // Navigation and an intentionally newer request take priority over a late response.
     if (activeView === 'new' && viewEpoch === attempt.epoch && starting === attempt) {
@@ -491,7 +522,12 @@ let mode = store.get('cockpit-mode') || ((framed || touch) ? 'read' : 'live');
 let readerEpoch = 0, readerBusy = false;
 let readTimer = null, lastText = null, lastSize = '', wsRetry = 0, wsTimer = null;
 let liveEpoch = 0;
-let needsResponse = false, outputSource = null;
+let needsResponse = false, outputSource = null, questionReady = false;
+const questionBlocked = (name = current) => name === current && needsResponse && (!questionReady || mode !== 'read');
+function invalidateQuestion() {
+  questionReady = false;
+  if (current && needsResponse) actionState(current).generation++;
+}
 // Page-only help state belongs to the task, never to a delivery acknowledgement.
 const startupHelp = new Map();
 function renderStartupHelp() {
@@ -499,7 +535,7 @@ function renderStartupHelp() {
   const generic = !!help && !help.dismissed && !help.hasMessages;
   $('#startup-note').hidden = !!taskActions.get(current)?.uncertain || endedTasks.has(current) || (!needsResponse && !generic);
   $('#startup-help').textContent = needsResponse
-    ? 'Review the assistant’s question, then choose Respond.'
+    ? (questionBlocked() ? (mode === 'read' ? 'Loading the current question. You can respond when it appears.' : 'Tap Respond to read the current question before answering.') : 'Review the assistant’s question, then choose Respond.')
     : 'Review any setup questions before sending a message.';
   $('#startup-respond').hidden = !needsResponse;
   $('#dismiss-startup').hidden = needsResponse || !generic;
@@ -561,17 +597,19 @@ function actionState(name) {
 function renderTaskControls() {
   if (!current) return;
   const ended = endedTasks.has(current), a = actionState(current);
-  const blocked = ended || !!a.uncertain;
+  const blocked = ended || !!a.uncertain || questionBlocked();
   if (blocked) closeShortKeys(false);
   renderStartupHelp();
   for (const b of $('#keys').children) if (b.dataset.key) b.disabled = blocked;
   $('#send-btn').disabled = blocked || sending.has(current);
   $('#send-btn').textContent = sending.has(current) ? 'Sending…' : 'Send';
   for (const id of ['#kill-btn', '#mode-btn', '#keys-toggle', '#startup-respond', '#attach-btn']) $(id).disabled = ended;
+  for (const id of ['#keys-toggle', '#startup-respond']) $(id).disabled = ended || !!a.uncertain || (mode === 'read' && questionBlocked());
   $('#mic-btn').disabled = ended || ending || dictations.has(current) || $('#mic-btn').classList.contains('busy');
   recoveryControls.hidden = checkDelivery.hidden = reviewDelivery.hidden = !a.uncertain || ended;
   checkDelivery.hidden = checkDelivery.hidden || !a.uncertain?.request;
-  checkDelivery.disabled = reviewDelivery.disabled = !!a.checking;
+  checkDelivery.disabled = !!a.checking;
+  reviewDelivery.disabled = !!a.checking || questionBlocked();
 }
 function settleTask(name) {
   endedTasks.add(name);
@@ -585,17 +623,17 @@ function settleTask(name) {
   $('#t-status').className = 'pill exited'; $('#t-status').textContent = 'Ended / unavailable';
   $('#startup-note').hidden = true;
   connection('ended');
-  note('This task ended or is unavailable. Draft and displayed output kept. Use Back to return to tasks.');
+  note('');
   readerState('Task ended or unavailable. Output retries stopped.');
-  sessionDelivery(name, 'Task ended or unavailable. Draft and displayed output kept.', true);
+  sessionDelivery(name, 'Task ended or unavailable. Your draft is kept.', true);
   renderTaskControls();
 }
 function enqueueAction(name, payload, onAck = () => {}) {
   const a = actionState(name), generation = a.generation;
-  if (endedTasks.has(name) || a.uncertain) return Promise.resolve(false);
+  if (endedTasks.has(name) || a.uncertain || questionBlocked(name)) return Promise.resolve(false);
   a.pending++;
   const next = a.tail.then(async () => {
-    if (endedTasks.has(name) || a.uncertain || generation !== a.generation) return false;
+    if (endedTasks.has(name) || a.uncertain || questionBlocked(name) || generation !== a.generation) return false;
     let request, attempted = false;
     try {
       // A fresh random ID and boot identity bind this exact input. Checking never
@@ -620,6 +658,10 @@ function enqueueAction(name, payload, onAck = () => {}) {
         sessionDelivery(name, (payload.text !== undefined ? 'Message not sent. ' : 'Key not sent. ') + err.message + ' Your draft is kept.', true);
       } else {
         a.uncertain = { request, onAck };
+        if (current === name && needsResponse) {
+          stopReader();
+          if (mode === 'read') startReader();
+        }
         sessionDelivery(name, 'Delivery unconfirmed — do not repeat Enter. Check delivery first.', true);
       }
       return false;
@@ -662,7 +704,7 @@ checkDelivery.onclick = async () => {
 reviewDelivery.onclick = () => {
   if (!current || endedTasks.has(current)) return;
   const a = actionState(current);
-  if (a.checking) return;
+  if (a.checking || questionBlocked()) return;
   try { saveActionMarker(current, false); } catch {
     sessionDelivery(current, 'Reload recovery could not be cleared. Controls remain disabled; keep this page open.', true); return;
   }
@@ -671,14 +713,14 @@ reviewDelivery.onclick = () => {
   renderTaskControls();
 };
 
-function openTerm(name, session = state.sessions.find((s) => s.name === name), justCreated = false) {
+function openTerm(name, session = state.sessions.find((s) => s.name === name), justCreated = false, recordHistory = true) {
   if (justCreated && session?.lane !== 'shell' && !startupHelp.has(name)) {
     startupHelp.set(name, { dismissed: false, hasMessages: false });
   }
   closeTerm();
   show('term');
   current = name;
-  history.replaceState(null, '', '#' + name);
+  routeURL('term', name, !recordHistory);
   renderTermIdentity(session, name);
   micState('idle');
   renderDictation();
@@ -692,21 +734,36 @@ function openTerm(name, session = state.sessions.find((s) => s.name === name), j
   disarm();
   connection('reconnecting');
   lastSize = '';
-  if (endedTasks.has(name)) settleTask(name); else setMode(mode);
+  if (endedTasks.has(name) || session?.dead || session?.status === 'exited') {
+    // Output belongs only to the open view. Reopening does not retain transcripts.
+    $('#reader').hidden = false; $('#term').hidden = true;
+    $('#reader').classList.add('empty-output');
+    $('#reader').textContent = 'No output retained for this ended task.\n\nOutput is available only while you keep the task open.';
+    $('#answer-start').hidden = $('#to-bottom').hidden = true;
+    labelOutput('terminal');
+    settleTask(name);
+  } else setMode(mode);
   refresh();
 }
 
 function closeTerm() {
   micGeneration++;
   if (current) composer(current).draft = $('#input').value;
+  stopReader();
   current = null;
+  needsResponse = false;
+  $('#reader').textContent = '';
+  $('#reader').classList.remove('conversation');
+  $('#reader').classList.remove('empty-output');
+  lastText = null;
   closeShortKeys(false);
   if (rec && rec.state === 'recording') rec.stop();
-  stopReader(); stopLive();
+  stopLive();
 }
 
 function setMode(m) {
   if (endedTasks.has(current)) return;
+  stopReader(); closeShortKeys(false);
   mode = m; store.set('cockpit-mode', m);
   $('#mode-btn').textContent = m === 'read' ? 'Live' : 'Read';
   $('#mode-btn').setAttribute('aria-label', m === 'read' ? 'Switch to live terminal' : 'Switch to readable output');
@@ -716,7 +773,8 @@ function setMode(m) {
   renderStartupHelp();
   $('#term').hidden = m !== 'live';
   $('#to-bottom').hidden = true;
-  if (m === 'read') { stopLive(); startReader(); } else { stopReader(); startLive(); }
+  if (m === 'read') { stopLive(); startReader(); } else startLive();
+  renderTaskControls();
 }
 $('#mode-btn').onclick = () => current && setMode(mode === 'read' ? 'live' : 'read');
 
@@ -833,6 +891,7 @@ async function pullReader() {
   } catch (err) {
     if (name === current && epoch === readerEpoch) {
       if (err.status === 404 || err.status === 410) { settleTask(name); return; }
+      if (reviewQuestion) { invalidateQuestion(); renderTaskControls(); }
       note('Connection lost — retrying…'); connection('offline');
       readerState('Output unavailable. Retrying automatically.');
       if (lastText === null) $('#reader').textContent = 'Output unavailable. Retrying…';
@@ -840,6 +899,14 @@ async function pullReader() {
     return;
   } finally { if (epoch === readerEpoch) readerBusy = false; }
   if (name !== current || mode !== 'read' || epoch !== readerEpoch || reviewQuestion !== needsResponse) return;
+  // A raw question must be nonempty terminal text, never a saved conversation.
+  if (reviewQuestion && (typeof text !== 'string' || !text.trim())) {
+    invalidateQuestion(); renderTaskControls();
+    $('#reader').textContent = 'Current question unavailable. Retrying…';
+    lastText = null;
+    readerState('Current question unavailable. Response keys disabled.');
+    return;
+  }
   const conversation = text && typeof text === 'object' && text.source === 'conversation' && Array.isArray(text.messages) ? text : null;
   const messages = conversation ? conversation.messages : null;
   const source = conversation ? 'conversation' : 'terminal';
@@ -858,6 +925,7 @@ async function pullReader() {
   readerHeight = el.clientHeight;
   if (text === lastText && !sourceChanged) {
     if (resized && readerFollow) el.scrollTop = el.scrollHeight;
+    if (reviewQuestion) { questionReady = true; renderTaskControls(); }
     return;
   }
   const stick = lastText === null || readerFollow || nearBottom(el);
@@ -879,6 +947,7 @@ async function pullReader() {
     readerFollow = stick;
   }
   $('#to-bottom').hidden = nearBottom(el);
+  if (reviewQuestion) { questionReady = true; renderTaskControls(); }
 }
 function startReader() {
   connection('reconnecting');
@@ -894,7 +963,7 @@ function startReader() {
   pullReader();
   readTimer = setInterval(pullReader, 1500);
 }
-function stopReader() { clearInterval(readTimer); readTimer = null; readerEpoch++; readerBusy = false; }
+function stopReader() { invalidateQuestion(); clearInterval(readTimer); readTimer = null; readerEpoch++; readerBusy = false; }
 $('#reader').addEventListener('scroll', () => {
   const el = $('#reader');
   // A resize may dispatch a native scroll event before ResizeObserver runs.
@@ -946,7 +1015,7 @@ function startLive() {
   terminal.open($('#term'));
   fit.fit();
   terminal.onData((d) => {
-    if (!liveActive(name, terminal, epoch) || actionState(name).uncertain || actionState(name).pending) return;
+    if (!liveActive(name, terminal, epoch) || questionBlocked(name) || actionState(name).uncertain || actionState(name).pending) return;
     const sock = ws;
     if (sock && sock.readyState === 1) sock.send(JSON.stringify({ t: 'in', d }));
   });
@@ -1024,7 +1093,7 @@ syncViewport();
 $('#keys').replaceChildren(...QUICK_KEYS.map(([label, key], index) => {
   const b = document.createElement('button');
   b.type = 'button'; b.textContent = label;
-  b.setAttribute('aria-label', key === 'Enter' ? 'Submit current terminal input' : key);
+  b.setAttribute('aria-label', key === 'Enter' ? 'Submit current terminal input' : key === 'Escape' ? 'Send Escape to terminal' : key);
   if (index > 3) b.className = 'extra-key';
   b.dataset.key = key;
   b.onclick = async () => {
@@ -1052,6 +1121,15 @@ moreKeys.onclick = () => {
   refit();
 };
 $('#keys').append(moreKeys);
+const controlsHeading = document.createElement('div');
+controlsHeading.className = 'controls-heading';
+const controlsTitle = document.createElement('span'); controlsTitle.textContent = 'Response controls';
+const closeControls = document.createElement('button');
+closeControls.type = 'button'; closeControls.textContent = 'Done';
+closeControls.setAttribute('aria-label', 'Close response controls without sending a key');
+closeControls.onclick = () => closeShortKeys();
+controlsHeading.append(controlsTitle, closeControls);
+$('#keys').insertBefore(controlsHeading, $('#keys').firstElementChild);
 const keysToggle = $('#keys-toggle');
 let responseTrigger = null;
 function closeShortKeys(restoreFocus = true) {
@@ -1065,18 +1143,24 @@ function closeShortKeys(restoreFocus = true) {
 }
 function openResponseControls(trigger = keysToggle) {
   if (!current || endedTasks.has(current) || actionState(current).uncertain) return;
+  if (needsResponse && mode !== 'read') { setMode('read'); return; }
+  if (questionBlocked()) return;
   responseTrigger = trigger;
   $('#keys').classList.add('short-open');
   keysToggle.setAttribute('aria-expanded', 'true');
   $('#startup-respond').setAttribute('aria-expanded', 'true');
   keysToggle.setAttribute('aria-label', 'Hide response controls');
-  $('#keys button').focus();
+  if (matchMedia('(max-width: 600px), (max-height: 400px)').matches) closeControls.focus();
+  else $('#keys button[data-key]').focus();
 }
 keysToggle.onclick = () => {
   if ($('#keys').classList.contains('short-open')) closeShortKeys();
   else openResponseControls();
 };
-$('#startup-respond').onclick = () => openResponseControls($('#startup-respond'));
+$('#startup-respond').onclick = () => {
+  if ($('#keys').classList.contains('short-open')) closeShortKeys();
+  else openResponseControls($('#startup-respond'));
+};
 $('#keys').onkeydown = (event) => {
   if (event.key !== 'Escape' || !$('#keys').classList.contains('short-open')) return;
   event.preventDefault();
@@ -1097,7 +1181,7 @@ const sending = new Set();
 $('#input-row').onsubmit = async (e) => {
   e.preventDefault();
   const name = current;
-  if (!name || sending.has(name) || endedTasks.has(name) || actionState(name).uncertain) return;
+  if (!name || sending.has(name) || endedTasks.has(name) || actionState(name).uncertain || questionBlocked(name)) return;
   const c = composer(name);
   if (c.pending.some((p) => !p.path)) return delivery('Still uploading…');
   const draft = c.draft;
@@ -1417,8 +1501,30 @@ document.addEventListener('visibilitychange', () => {
 // hand back a token it kept.
 embedReady.then(() => tellParent(device.get() ? { type: 'cockpit-device', token: device.get() } : { type: 'cockpit-hello' }));
 recoveryUI();
+function restoreRoute() {
+  // History changes navigate only. They never start a task or repeat terminal input.
+  if (activeView === 'pair') return;
+  let name;
+  try { name = decodeURIComponent(location.hash.slice(1)); } catch { name = ''; }
+  if (name && name !== '@new' && !stateLoaded) {
+    // An empty initial array is not evidence that this task is unavailable.
+    // Show the connection/list state without destroying the pending destination.
+    if (activeView !== 'list') show('list', false, true);
+    pendingRoute = { hash: location.hash, epoch: viewEpoch };
+    return;
+  }
+  pendingRoute = null;
+  if (name === '@new') {
+    if (activeView !== 'new') openNewTask(false);
+  } else if (name && state.sessions.some(s => s.name === name)) {
+    if (activeView !== 'term' || current !== name) openTerm(name, undefined, false, false);
+  } else if (activeView !== 'list' || name || location.hash !== '#') show('list', false);
+}
+window.addEventListener('popstate', restoreRoute);
+window.addEventListener('hashchange', restoreRoute);
+const initialViewEpoch = viewEpoch;
 refresh().then(() => {
   $('#mic-btn').hidden = !(state.transcribe && canRecord());
-  const h = decodeURIComponent(location.hash.slice(1));
-  if (h && state.sessions.some((s) => s.name === h)) openTerm(h);
+  // A late initial response must not reopen a task after deliberate navigation.
+  if (viewEpoch === initialViewEpoch) restoreRoute();
 });

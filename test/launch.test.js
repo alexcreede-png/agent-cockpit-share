@@ -36,3 +36,35 @@ process.stdout.write(JSON.stringify(args.length ? args[0].slice('--prompt-intera
   assert.equal(fs.existsSync(path.join(dir, 'SHOULD_NOT_EXIST')), false);
   assert.equal(fs.existsSync(path.join(dir, 'ALSO_NOT_EXIST')), false);
 });
+
+
+test('positional launchers keep option-looking first messages literal and upload options separate', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cockpit-positional-launch-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const lane of ['claude','codex','grok']) {
+    fs.writeFileSync(path.join(dir,lane), `#!${process.execPath}
+const args=process.argv.slice(2), options=[], positional=[]; let literal=false;
+for (const arg of args) {
+  if (!literal && arg==='--') { literal=true; continue; }
+  if (!literal && arg.startsWith('--add-dir=')) options.push(arg.slice('--add-dir='.length));
+  else if (!literal) { console.error('Prompt exposed to option/subcommand parsing'); process.exit(64); }
+  else positional.push(arg);
+}
+process.stdout.write(JSON.stringify({options,positional}));
+`, {mode:0o700});
+  }
+  const launch=(command,prompt,uploads)=>spawnSync('/bin/zsh',['-f','-c',command],{
+    cwd:dir,env:{PATH:dir,COCKPIT_PROMPT:prompt,COCKPIT_UPLOADS:uploads},encoding:'utf8',timeout:5000,
+  });
+  assert.equal(launch('exec grok "$COCKPIT_PROMPT"','--help','').status,64,'detects original missing delimiter');
+  for (const lane of ['claude','codex','grok']) for (const uploads of ['', '/example/uploads with spaces']) {
+    for (const prompt of ['', '--help', '--', '-p', 'resume', 'First line\nSecond line', '日本語 🌿',
+      "Literal '$HOME'; $(touch SHOULD_NOT_EXIST) `touch ALSO_NOT_EXIST` & | < >", 'x'.repeat(7999)+'終']) {
+      const result=launch(LANES[lane],prompt,uploads);
+      assert.equal(result.status,0,lane+': '+result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout),{options:lane!=='grok'&&uploads?[uploads]:[],positional:prompt?[prompt]:[]});
+    }
+  }
+  assert.equal(fs.existsSync(path.join(dir,'SHOULD_NOT_EXIST')),false);
+  assert.equal(fs.existsSync(path.join(dir,'ALSO_NOT_EXIST')),false);
+});
