@@ -114,11 +114,28 @@ function taskTime(s) {
   }) : ago(s.created);
 }
 
+
+// Start timestamps have second precision. Distinguish simultaneous same-project tasks
+// with their existing name suffix, never an ordinal that changes as rows move or end.
+function taskTag(s) {
+  if (!s) return '';
+  const peers = state.sessions.filter(x => x.project === s.project && x.lane === s.lane
+    && Math.floor(x.created / 1000) === Math.floor(s.created / 1000));
+  if (peers.length < 2) return '';
+  const short = x => /-([0-9a-f]{4}|[0-9a-f]{32})$/.exec(x.name)?.[1].slice(-6) || x.name;
+  const tag = short(s);
+  return peers.some(x => x.name !== s.name && short(x) === tag) ? s.name : tag;
+}
+function taskContext(s) {
+  const tag = taskTag(s);
+  return `${assistantName(s.lane)}${tag ? ` · Task ${tag}` : ''}`;
+}
+
 function renderTermIdentity(s, name = current) {
   $('#t-name').textContent = displayProject(s) || name;
   $('#t-name').title = s ? `${displayProject(s)} — ${name}` : name;
   $('#t-name').setAttribute('aria-label', s ? displayProject(s) : 'Task');
-  $('#t-context').textContent = s ? assistantName(s.lane) : 'Starting task';
+  $('#t-context').textContent = s ? taskContext(s) : 'Starting task';
   const pill = $('#t-status');
   pill.className = 'pill ' + (s ? s.status : 'idle');
   pill.textContent = s ? STATUS_LABEL[s.status] || s.status : 'starting';
@@ -157,8 +174,8 @@ function renderList() {
     b.querySelector('.name').textContent = displayProject(s);
     b.querySelector('.pill').className = `pill ${s.status}`;
     b.querySelector('.pill').textContent = STATUS_LABEL[s.status] || s.status;
-    b.querySelector('.meta').textContent = `${assistantName(s.lane)} · ${taskTime(s)}`;
-    b.setAttribute('aria-label', `${displayProject(s)}, ${STATUS_LABEL[s.status] || s.status}, ${assistantName(s.lane)}, ${taskTime(s)}`);
+    b.querySelector('.meta').textContent = `${taskContext(s)} · ${taskTime(s)}`;
+    b.setAttribute('aria-label', `${displayProject(s)}, ${STATUS_LABEL[s.status] || s.status}, ${taskContext(s)}, ${taskTime(s)}`);
     b.title = `${displayProject(s)} — ${s.name}`;
     if (ul.children[index] !== li) ul.insertBefore(li, ul.children[index] || null);
     existing.delete(s.name);

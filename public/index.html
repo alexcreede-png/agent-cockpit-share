@@ -21,12 +21,14 @@
     <h1>Cockpit</h1>
     <button id="new-btn" class="primary">New task</button>
   </header>
+  <div class="list-content">
   <div class="home-heading"><h2>Your tasks</h2><p id="summary" class="muted">Tasks run on your Mac.</p></div>
   <div class="list-tools"><label class="sr-only" for="session-search">Search tasks</label><input id="session-search" type="search" placeholder="Search tasks or projects" autocomplete="off"></div>
   <p id="pending-list" class="field-help pending-list" role="status" hidden></p>
   <ul id="sessions"></ul>
   <p id="list-state" class="muted center" role="status">Loading tasks…</p>
   <div id="empty" class="empty-state" hidden><span class="empty-symbol" aria-hidden="true">＋</span><h2>Start something on your Mac</h2><p>Choose Grok or Gemini / Antigravity, pick a project, and describe your task.</p><p>Your tasks run on the Mac and keep running when you leave this app. Return here to read and reply.</p><button id="empty-new-btn" class="primary">New task</button></div>
+  </div>
   <p id="conn" class="warn center" role="alert" hidden>Can’t reach the Mac. Reconnecting…</p>
 </section>
 

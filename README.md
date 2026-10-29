@@ -13,7 +13,7 @@ request. Read **Security** below before you run it.
 
 | Screen | Actions |
 | --- | --- |
-| Your tasks | Search by project or assistant; see working / needs you / idle / ended status. Same-project tasks show their start time. |
+| Your tasks | Search by project or assistant; see working / needs you / idle / ended status. Same-project tasks show their start time; simultaneous starts also show a short task identifier in the list and task header. The heading, search and task rows scroll together below the fixed header, including on short screens with larger text. |
 | New task | Choose Grok or Gemini / Antigravity, a project, and an optional first message. Claude, Codex and Terminal remain under More assistants. Choices and draft stay available after a failed start; project loading can be retried in place. |
 | Session | **Read** view (default on phones): the whole scrollback, swipeable, refreshed live, with a "↓ Latest" button. **Live** view: the real terminal, reconnects by itself. Quick keys (Esc, Enter, arrows, Tab, Shift-Tab, Ctrl-C, 1/2/3, y/n). Message box (multi-line is sent as one message). 📎 attach photos, camera shots or files; 🎤 dictate (transcribed on the Mac, lands in the box for review). End (two taps) |
 

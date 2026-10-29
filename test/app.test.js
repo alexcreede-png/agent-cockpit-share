@@ -2115,3 +2115,58 @@ test('a delayed microphone rejection cannot overwrite a newer send receipt', asy
   assert.equal(h.el('#delivery').textContent, receipt);
   assert.equal(h.el('#input').value, '');
 });
+
+test('same-second tasks remain distinguishable in visible labels, spoken labels and the opened task', async () => {
+  const h = frontend(); await tick();
+  h.setup.sessions = [
+    {name:'grok-alpha-a1b2',lane:'grok',project:'/example/alpha',created:1000001,status:'working'},
+    {name:'grok-alpha-c3d4',lane:'grok',project:'/example/alpha',created:1000999,status:'working'},
+  ];
+  await vm.runInContext('refresh()',h.context);
+  const rows = () => h.el('#sessions').children.map(li=>li.firstElementChild);
+  assert.notEqual(rows()[0].querySelector('.meta').textContent,rows()[1].querySelector('.meta').textContent);
+  assert.notEqual(rows()[0]['aria-label'],rows()[1]['aria-label']);
+  const original = new Map(h.el('#sessions').children.map(li=>[li.dataset.name,li.firstElementChild.querySelector('.meta').textContent]));
+  for (const row of [...rows()]) {
+    row.click(); await tick();
+    const name=vm.runInContext('current',h.context);
+    assert.match(h.el('#t-context').textContent,new RegExp('Task '+name.slice(-4)));
+    assert.equal(h.context.location.hash,'#'+name);
+    vm.runInContext("show('list')",h.context); await tick();
+  }
+  h.setup.sessions.reverse(); h.setup.sessions[0].status='idle';
+  await vm.runInContext('refresh()',h.context);
+  for(const li of h.el('#sessions').children)assert.equal(li.firstElementChild.querySelector('.meta').textContent,original.get(li.dataset.name));
+  h.el('#session-search').value='c3d4'; h.el('#session-search').oninput();
+  assert.equal(h.el('#sessions').children.length,1);
+  assert.match(rows()[0].querySelector('.meta').textContent,/Task c3d4/);
+});
+
+test('duplicate short identifiers fall back to exact names while ordinary tasks keep simple labels', async () => {
+  const h=frontend(); await tick();
+  h.setup.sessions=[
+    {name:'grok-old-a1b2',lane:'grok',project:'/example/alpha',created:1000000,status:'idle'},
+    {name:'grok-new-a1b2',lane:'grok',project:'/example/alpha',created:1000000,status:'idle'},
+    {name:'grok-beta-f1e2',lane:'grok',project:'/example/beta',created:1000000,status:'idle'},
+  ];
+  await vm.runInContext('refresh()',h.context);
+  const meta=h.el('#sessions').children.map(li=>li.firstElementChild.querySelector('.meta').textContent);
+  assert.match(meta[0],/Task grok-old-a1b2/); assert.match(meta[1],/Task grok-new-a1b2/);
+  assert.doesNotMatch(meta[2],/Task /);
+});
+
+test('simultaneous safe-start tasks use compact identifiers instead of long internal launch names', async () => {
+  const h=frontend(); await tick();
+  h.setup.sessions=[
+    {name:'grok-start-11111111111111111111111111a1b2c3',lane:'grok',project:'/example/alpha',created:1000000,status:'idle'},
+    {name:'grok-start-22222222222222222222222222d4e5f6',lane:'grok',project:'/example/alpha',created:1000000,status:'idle'},
+  ];
+  await vm.runInContext('refresh()',h.context);
+  const buttons=h.el('#sessions').children.map(li=>li.firstElementChild);
+  for(const [i,tag] of ['a1b2c3','d4e5f6'].entries()){
+    assert.match(buttons[i].querySelector('.meta').textContent,new RegExp('Task '+tag));
+    assert.doesNotMatch(buttons[i]['aria-label'],/grok-start-/);
+    buttons[i].click(); await tick();
+    assert.equal(h.el('#t-context').textContent,'Grok · Task '+tag);
+  }
+});
