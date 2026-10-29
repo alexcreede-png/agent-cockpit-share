@@ -1239,3 +1239,40 @@ test('a state request begun before opening a task cannot settle that newly opene
   await vm.runInContext('refresh()', h.context);
   assert.equal(h.el('#send-btn').disabled, false);
 });
+
+test('pairing prevents a second code redemption while the first is pending', async () => {
+  let finishPair;
+  const h = frontend({ requestHook: async (path) => {
+    if (path !== '/api/pair') return;
+    await new Promise(resolve => { finishPair = resolve; });
+    return {ok:false,status:403,json:async()=>({error:'wrong or expired code'})};
+  } });
+  await tick();
+  h.el('#pair-code').value = 'ABCD-EFGH';
+  const first = h.el('#pair-form').onsubmit({preventDefault(){}});
+  await tick();
+  assert.equal(h.el('#pair-submit').disabled, true);
+  await h.el('#pair-form').onsubmit({preventDefault(){}});
+  assert.equal(h.calls.filter(c => c.path === '/api/pair').length, 1);
+  finishPair(); await first;
+  assert.equal(h.el('#pair-submit').disabled, false);
+  assert.match(h.el('#pair-err').textContent, /incorrect or has expired/);
+  assert.equal(h.el('#pair-code').value, 'ABCD-EFGH');
+});
+
+test('pairing distinguishes uncertain transport from rejected codes and forbidden connections', async () => {
+  for (const failure of ['network','forbidden']) {
+    const h = frontend({ requestHook: async path => {
+      if (path !== '/api/pair') return;
+      if (failure === 'network') throw new Error('network failed');
+      return {ok:false,status:403,json:async()=>({error:'forbidden'})};
+    }});
+    await tick();
+    await h.el('#pair-form').onsubmit({preventDefault(){}});
+    const message = h.el('#pair-err').textContent;
+    assert.match(message, failure === 'network' ? /Couldn’t confirm.*Reload/ : /connection is not allowed/);
+    assert.doesNotMatch(message, /incorrect or has expired/);
+    assert.equal(h.calls.filter(c => c.path === '/api/pair').length, 1);
+    assert.equal(h.el('#pair-submit').disabled, false);
+  }
+});

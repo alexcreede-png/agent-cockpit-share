@@ -32,12 +32,15 @@
 
 <!-- Pair this phone (shown when the server says "unpaired") -->
 <section id="pair-view" class="view" hidden>
-  <header class="bar"><h1>Pair this phone</h1></header>
+  <header class="bar"><h1>Cockpit</h1></header>
   <form id="pair-form" class="pair">
-    <p class="muted">On the Mac, in the cockpit folder, run <code>npm run pair</code> and type the code here. It works once and expires in 10 minutes.</p>
-    <input id="pair-code" inputmode="text" autocapitalize="characters" autocomplete="one-time-code" autocorrect="off" spellcheck="false" maxlength="12" placeholder="ABCD-EFGH" required>
-    <button class="primary" type="submit">Pair</button>
-    <p id="pair-err" class="warn"></p>
+    <div class="pair-intro"><h2>Connect to your Mac</h2><p class="muted">Enter the one-time code from your Mac to use Cockpit on this phone.</p></div>
+    <label for="pair-code">Pairing code</label>
+    <input id="pair-code" inputmode="text" autocapitalize="characters" autocomplete="one-time-code" autocorrect="off" spellcheck="false" maxlength="12" placeholder="ABCD-EFGH" aria-describedby="pair-help pair-err" required>
+    <p id="pair-help" class="field-help">Each code works once and expires after 10 minutes.</p>
+    <button id="pair-submit" class="primary" type="submit">Connect this phone</button>
+    <p id="pair-err" class="warn" role="alert"></p>
+    <details class="pair-instructions"><summary>Get a code from your Mac</summary><p>On your Mac, open Terminal in the Agent Cockpit folder and run:</p><pre><code>npm run pair</code></pre><p>Leave the code on your Mac’s screen, then enter it above. Keep Tailscale connected on both devices.</p></details>
   </form>
 </section>
 

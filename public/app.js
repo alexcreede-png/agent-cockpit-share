@@ -201,8 +201,13 @@ async function refresh() {
 
 // ---------- pairing ----------
 // This phone has no device cookie yet: trade the one-time code from `npm run pair` for one.
+let pairingBusy = false;
 $('#pair-form').onsubmit = async (ev) => {
   ev.preventDefault();
+  if (pairingBusy) return;
+  pairingBusy = true;
+  const button = $('#pair-submit');
+  button.disabled = true; button.textContent = 'Connecting…';
   $('#pair-err').textContent = '';
   try {
     const r = await post('/api/pair', { code: $('#pair-code').value });
@@ -210,7 +215,14 @@ $('#pair-form').onsubmit = async (ev) => {
     tellParent({ type: 'cockpit-device', token: r.token });
     location.reload();
   } catch (e) {
-    $('#pair-err').textContent = e.message === 'unpaired' ? 'Not paired.' : 'Wrong or expired code. Run npm run pair again.';
+    $('#pair-err').textContent = e.message === 'wrong or expired code'
+      ? 'That code is incorrect or has expired. Get a new code from your Mac and try again.'
+      : e.message === 'forbidden'
+        ? 'This connection is not allowed. Open Cockpit through Tailscale and try again.'
+        : 'Couldn’t confirm the connection. Reload this page. If it still asks for a code, get a new one from your Mac.';
+  } finally {
+    pairingBusy = false;
+    button.disabled = false; button.textContent = 'Connect this phone';
   }
 };
 
