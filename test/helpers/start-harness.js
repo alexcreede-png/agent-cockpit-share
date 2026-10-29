@@ -61,6 +61,8 @@ function fakeMachine() {
       case 'list-panes': return [...machine.sessions.values()].map((s) =>
         `${s.name}\t${s.metadata['@lane'] || ''}\t${s.metadata['@project'] || ''}\t1\t${s.dead ? 1 : 0}\t\t0`).join('\n');
       case 'kill-session': { const s = lookup(value('-t')); machine.sessions.delete(s.name); return ''; }
+      case 'load-buffer': return '';
+      case 'paste-buffer': case 'send-keys': lookup(value('-t')); return '';
       case 'capture-pane': lookup(value('-t')); return machine.screen || '';
       case 'set-hook': return '';
       default: throw new Error(`unexpected fake tmux command ${a[0]}`);

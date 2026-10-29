@@ -158,7 +158,7 @@ $('#session-search').oninput = renderList;
 
 function connection(value) {
   const el = $('#connection-state');
-  const text = value === 'connected' ? 'Connected' : value === 'reconnecting' ? 'Reconnecting…' : 'Offline';
+  const text = value === 'ended' ? 'Ended / unavailable' : value === 'connected' ? 'Connected' : value === 'reconnecting' ? 'Reconnecting…' : 'Offline';
   if (el.textContent !== text) el.textContent = text;
   el.setAttribute('aria-label', el.textContent);
   el.dataset.state = value;
@@ -168,6 +168,7 @@ let refreshBusy = false;
 async function refresh() {
   if (refreshBusy) return;
   refreshBusy = true;
+  const viewed = current, epoch = viewEpoch;
   try {
     const next = await api('/api/state');
     const lanesChanged = JSON.stringify(state.lanes) !== JSON.stringify(next.lanes);
@@ -178,10 +179,10 @@ async function refresh() {
     $('#conn').hidden = true;
     renderList();
     if (current && mode === 'live' && ws && ws.readyState === 1) connection('connected');
-    if (current) {
+    if (current && current === viewed && viewEpoch === epoch) {
       const s = state.sessions.find((x) => x.name === current);
-      if (s) renderTermIdentity(s);
-      else { $('#t-status').className = 'pill exited'; $('#t-status').textContent = 'gone'; }
+      if (!s || s.dead || s.status === 'exited') settleTask(current);
+      else if (!endedTasks.has(current)) renderTermIdentity(s);
     }
   } catch (e) {
     if (e.message === 'unpaired') {
@@ -191,7 +192,7 @@ async function refresh() {
       return;
     }
     $('#conn').hidden = false;
-    if (current) connection('offline');
+    if (current && !endedTasks.has(current)) connection('offline');
     $('#list-state').hidden = true;
   } finally {
     refreshBusy = false;
@@ -476,7 +477,7 @@ const startupHelp = new Map();
 function renderStartupHelp() {
   const help = startupHelp.get(current);
   const generic = !!help && !help.dismissed && !help.hasMessages;
-  $('#startup-note').hidden = !needsResponse && !generic;
+  $('#startup-note').hidden = !!taskActions.get(current)?.uncertain || endedTasks.has(current) || (!needsResponse && !generic);
   $('#startup-help').textContent = needsResponse
     ? 'Review the assistant’s question, then choose Respond.'
     : 'Review any setup questions before sending a message.';
@@ -506,6 +507,149 @@ const composer = (name) => {
 };
 const activeComposer = () => current ? composer(current) : null;
 
+// A task's queue is shared by response keys and composer sends. A rejected or
+// uncertain action cancels already queued successors; they require a fresh tap.
+const taskActions = new Map(), endedTasks = new Set();
+// A bounded tab-local marker is written BEFORE dispatch. Reload cannot silently
+// enable another Enter after an in-flight action. No input/output is stored here.
+const ACTION_PENDING_KEY = 'cockpit-pending-actions-v1';
+let savedActionTasks = new Set(), actionStorageUnavailable = false;
+try {
+  const raw = sessionStorage.getItem(ACTION_PENDING_KEY);
+  if (raw) {
+    if (raw.length > 16384) throw new Error('oversized');
+    const names = JSON.parse(raw);
+    if (!Array.isArray(names) || names.length > 64 || names.some(n => typeof n !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(n))) throw new Error('invalid');
+    savedActionTasks = new Set(names);
+  }
+} catch { actionStorageUnavailable = true; }
+function saveActionMarker(name, pending) {
+  if (actionStorageUnavailable) throw new Error('Safe reload recovery is unavailable. Keep this page open; action not sent.');
+  const names = new Set(savedActionTasks);
+  pending ? names.add(name) : names.delete(name);
+  if (names.size > 64) throw new Error('Too many unresolved tasks. Review pending task output first.');
+  const raw = JSON.stringify([...names]);
+  if (names.size) sessionStorage.setItem(ACTION_PENDING_KEY, raw);
+  else sessionStorage.removeItem(ACTION_PENDING_KEY);
+  if ((sessionStorage.getItem(ACTION_PENDING_KEY) || '[]') !== raw) throw new Error('Safe reload recovery could not be saved.');
+  savedActionTasks = names;
+}
+function actionState(name) {
+  if (!taskActions.has(name)) taskActions.set(name, { tail: Promise.resolve(), generation: 0, uncertain: savedActionTasks.has(name) ? { reloaded: true } : null, pending: 0 });
+  return taskActions.get(name);
+}
+function renderTaskControls() {
+  if (!current) return;
+  const ended = endedTasks.has(current), a = actionState(current);
+  const blocked = ended || !!a.uncertain;
+  if (blocked) closeShortKeys(false);
+  renderStartupHelp();
+  for (const b of $('#keys').children) if (b.dataset.key) b.disabled = blocked;
+  $('#send-btn').disabled = blocked || sending.has(current);
+  $('#send-btn').textContent = sending.has(current) ? 'Sending…' : 'Send';
+  for (const id of ['#kill-btn', '#mode-btn', '#keys-toggle', '#startup-respond', '#attach-btn']) $(id).disabled = ended;
+  $('#mic-btn').disabled = ended || $('#mic-btn').classList.contains('busy');
+  recoveryControls.hidden = checkDelivery.hidden = reviewDelivery.hidden = !a.uncertain || ended;
+  checkDelivery.hidden = checkDelivery.hidden || !a.uncertain?.request;
+  checkDelivery.disabled = reviewDelivery.disabled = !!a.checking;
+}
+function settleTask(name) {
+  endedTasks.add(name);
+  try { saveActionMarker(name, false); } catch { /* The settled task remains disabled. */ }
+  const a = actionState(name); a.generation++;
+  if (current !== name) return;
+  composer(name).draft = $('#input').value;
+  stopReader(); stopLive(true); closeShortKeys(false);
+  needsResponse = false;
+  $('#t-status').className = 'pill exited'; $('#t-status').textContent = 'Ended / unavailable';
+  $('#startup-note').hidden = true;
+  connection('ended');
+  note('This task ended or is unavailable. Draft and displayed output kept. Use Back to return to tasks.');
+  readerState('Task ended or unavailable. Output retries stopped.');
+  sessionDelivery(name, 'Task ended or unavailable. Draft and displayed output kept.', true);
+  renderTaskControls();
+}
+function enqueueAction(name, payload, onAck = () => {}) {
+  const a = actionState(name), generation = a.generation;
+  if (endedTasks.has(name) || a.uncertain) return Promise.resolve(false);
+  a.pending++;
+  const next = a.tail.then(async () => {
+    if (endedTasks.has(name) || a.uncertain || generation !== a.generation) return false;
+    let request, attempted = false;
+    try {
+      // A fresh random ID and boot identity bind this exact input. Checking never
+      // executes unknown input, even if the first request did not reach the Mac.
+      if (!state.actionEpoch) throw new Error('Delivery checking unavailable. Refresh and review output.');
+      const bytes = new Uint8Array(16); crypto.getRandomValues(bytes);
+      request = { ...payload, actionId: Array.from(bytes, x => x.toString(16).padStart(2, '0')).join(''), actionEpoch: state.actionEpoch };
+      saveActionMarker(name, true);
+      attempted = true;
+      const receipt = await post(`/api/sessions/${name}/keys`, request);
+      if (receipt?.ok !== true || receipt.actionId !== request.actionId) throw new Error('Delivery receipt did not match this action.');
+      saveActionMarker(name, false);
+      if (!endedTasks.has(name)) onAck();
+      return true;
+    } catch (err) {
+      if (endedTasks.has(name)) return false;
+      a.generation++; // Never release queued Enter after a failed navigation/paste.
+      if (err.status === 404 || err.status === 410) { settleTask(name); return false; }
+      const rejected = [400, 401, 403, 413].includes(err.status) || err.code === 'ACTION_CAPACITY' || err.code === 'ACTION_INVALID';
+      if (rejected || !attempted) {
+        try { saveActionMarker(name, false); } catch { /* No terminal effect occurred. */ }
+        sessionDelivery(name, (payload.text !== undefined ? 'Message not sent. ' : 'Key not sent. ') + err.message + ' Your draft is kept.', true);
+      } else {
+        a.uncertain = { request, onAck };
+        sessionDelivery(name, 'Delivery unconfirmed — do not repeat Enter. Check delivery first.', true);
+      }
+      return false;
+    } finally {
+      if (current === name) renderTaskControls();
+    }
+  });
+  a.tail = next.catch(() => {});
+  return next.finally(() => { a.pending--; });
+}
+const checkDelivery = document.createElement('button');
+checkDelivery.className = 'text-button';
+checkDelivery.type = 'button'; checkDelivery.textContent = 'Check delivery'; checkDelivery.hidden = true;
+const reviewDelivery = document.createElement('button');
+reviewDelivery.className = 'text-button';
+reviewDelivery.type = 'button'; reviewDelivery.textContent = 'Reviewed — enable actions'; reviewDelivery.hidden = true;
+reviewDelivery.setAttribute('aria-label', 'I reviewed current output; enable new actions with previous delivery still unconfirmed');
+const recoveryControls = document.createElement('div');
+recoveryControls.className = 'reader-tools'; recoveryControls.hidden = true;
+recoveryControls.append(checkDelivery, reviewDelivery);
+$('#term-view').append(recoveryControls);
+checkDelivery.onclick = async () => {
+  const name = current;
+  if (!name || endedTasks.has(name)) return;
+  const a = actionState(name), uncertain = a.uncertain;
+  if (!uncertain?.request || a.checking) return;
+  a.checking = true; renderTaskControls();
+  try {
+    const receipt = await post(`/api/sessions/${name}/keys`, { ...uncertain.request, check: true });
+    if (receipt?.ok !== true || receipt.actionId !== uncertain.request.actionId) throw new Error('Delivery receipt did not match this action.');
+    if (endedTasks.has(name) || a.uncertain !== uncertain) return;
+    saveActionMarker(name, false);
+    a.uncertain = null; uncertain.onAck();
+    sessionDelivery(name, 'Delivery confirmed to terminal. Cancelled actions were not sent. Review current output before responding.');
+  } catch (err) {
+    if (err.status === 404 || err.status === 410) settleTask(name);
+    else if (!endedTasks.has(name)) sessionDelivery(name, 'Delivery still unconfirmed. ' + err.message + ' Review output; do not repeat Enter automatically.', true);
+  } finally { a.checking = false; if (current === name) renderTaskControls(); }
+};
+reviewDelivery.onclick = () => {
+  if (!current || endedTasks.has(current)) return;
+  const a = actionState(current);
+  if (a.checking) return;
+  try { saveActionMarker(current, false); } catch {
+    sessionDelivery(current, 'Reload recovery could not be cleared. Controls remain disabled; keep this page open.', true); return;
+  }
+  a.uncertain = null; a.generation++;
+  sessionDelivery(current, 'Previous delivery remains unconfirmed. New actions may repeat its effect; choose only after reviewing output.', true);
+  renderTaskControls();
+};
+
 function openTerm(name, session = state.sessions.find((s) => s.name === name), justCreated = false) {
   if (justCreated && session?.lane !== 'shell' && !startupHelp.has(name)) {
     startupHelp.set(name, { dismissed: false, hasMessages: false });
@@ -521,12 +665,12 @@ function openTerm(name, session = state.sessions.find((s) => s.name === name), j
   grow();
   renderPending();
   delivery(c.feedback.text, c.feedback.error);
-  $('#send-btn').disabled = sending.has(name);
-  $('#send-btn').textContent = sending.has(name) ? 'Sending…' : 'Send';
+  if (actionState(name).uncertain?.reloaded) sessionDelivery(name, 'Previous delivery is unconfirmed after reload. This page cannot check its receipt. Review current output before enabling new actions; do not repeat Enter automatically.', true);
+  renderTaskControls();
   disarm();
   connection('reconnecting');
   lastSize = '';
-  setMode(mode);
+  if (endedTasks.has(name)) settleTask(name); else setMode(mode);
   refresh();
 }
 
@@ -539,6 +683,7 @@ function closeTerm() {
 }
 
 function setMode(m) {
+  if (endedTasks.has(current)) return;
   mode = m; store.set('cockpit-mode', m);
   $('#mode-btn').textContent = m === 'read' ? 'Live' : 'Read';
   $('#mode-btn').setAttribute('aria-label', m === 'read' ? 'Switch to live terminal' : 'Switch to readable output');
@@ -563,7 +708,7 @@ function charBox(el) {
   return { w: r.width / 40, h: r.height };
 }
 function fitSession() {
-  if (!current) return;
+  if (!current || endedTasks.has(current)) return;
   let cols, rows;
   if (mode === 'live' && term) { cols = term.cols; rows = term.rows; }
   else {
@@ -653,7 +798,7 @@ function readerState(text, busy = false) {
   $('#reader').setAttribute('aria-busy', String(busy));
 }
 async function pullReader() {
-  if (!current || mode !== 'read' || readerBusy) return;
+  if (!current || endedTasks.has(current) || mode !== 'read' || readerBusy) return;
   const name = current, epoch = readerEpoch, reviewQuestion = needsResponse;
   readerBusy = true;
   let text;
@@ -662,8 +807,9 @@ async function pullReader() {
     // an owned saved conversation exists. Never replace that question with old chat.
     text = await api(`/api/sessions/${name}/history?lines=3000${reviewQuestion ? '' : '&format=reader'}`);
     if (name === current && epoch === readerEpoch) { note(''); connection('connected'); }
-  } catch {
+  } catch (err) {
     if (name === current && epoch === readerEpoch) {
+      if (err.status === 404 || err.status === 410) { settleTask(name); return; }
       note('Connection lost — retrying…'); connection('offline');
       readerState('Output unavailable. Retrying automatically.');
       if (lastText === null) $('#reader').textContent = 'Output unavailable. Retrying…';
@@ -765,7 +911,7 @@ new ResizeObserver(() => {
 
 // --- live terminal (reconnects by itself)
 const liveActive = (name, terminal, epoch) =>
-  current === name && mode === 'live' && term === terminal && liveEpoch === epoch;
+  current === name && !endedTasks.has(name) && mode === 'live' && term === terminal && liveEpoch === epoch;
 function startLive() {
   const name = current, epoch = ++liveEpoch;
   connection('reconnecting');
@@ -777,7 +923,7 @@ function startLive() {
   terminal.open($('#term'));
   fit.fit();
   terminal.onData((d) => {
-    if (!liveActive(name, terminal, epoch)) return;
+    if (!liveActive(name, terminal, epoch) || actionState(name).uncertain || actionState(name).pending) return;
     const sock = ws;
     if (sock && sock.readyState === 1) sock.send(JSON.stringify({ t: 'in', d }));
   });
@@ -812,12 +958,12 @@ function connect(name, terminal = term, epoch = liveEpoch) {
     wsTimer = timer;
   };
 }
-function stopLive() {
+function stopLive(preserveOutput = false) {
   liveEpoch++;
   clearTimeout(wsTimer);
   wsTimer = null;
   if (ws) { const s = ws; ws = null; s.onopen = s.onmessage = s.onclose = null; s.close(); }
-  if (term) { term.dispose(); term = null; $('#term').replaceChildren(); }
+  if (term && !preserveOutput) { term.dispose(); term = null; $('#term').replaceChildren(); }
   note('');
 }
 function refit() {
@@ -857,19 +1003,16 @@ $('#keys').replaceChildren(...QUICK_KEYS.map(([label, key], index) => {
   b.type = 'button'; b.textContent = label;
   b.setAttribute('aria-label', key === 'Enter' ? 'Submit current terminal input' : key);
   if (index > 3) b.className = 'extra-key';
+  b.dataset.key = key;
   b.onclick = async () => {
     const name = current;
-    if (!name || b.disabled) return;
-    b.disabled = true;
-    try {
-      await post(`/api/sessions/${name}/keys`, { key });
+    if (!name || b.disabled || endedTasks.has(name)) return;
+    await enqueueAction(name, { key }, () => {
       if (key === 'Enter') sessionDelivery(name, 'Enter sent to terminal');
       if (current !== name) return;
       if (['Enter', 'Escape', 'C-c', 'C-d'].includes(key)) closeShortKeys();
       setTimeout(pullReader, 300);
-    } catch (err) {
-      sessionDelivery(name, 'Key failed: ' + err.message, true);
-    } finally { b.disabled = false; }
+    });
   };
   return b;
 }));
@@ -898,7 +1041,7 @@ function closeShortKeys(restoreFocus = true) {
   responseTrigger = null;
 }
 function openResponseControls(trigger = keysToggle) {
-  if (!current) return;
+  if (!current || endedTasks.has(current) || actionState(current).uncertain) return;
   responseTrigger = trigger;
   $('#keys').classList.add('short-open');
   keysToggle.setAttribute('aria-expanded', 'true');
@@ -931,7 +1074,7 @@ const sending = new Set();
 $('#input-row').onsubmit = async (e) => {
   e.preventDefault();
   const name = current;
-  if (!name || sending.has(name)) return;
+  if (!name || sending.has(name) || endedTasks.has(name) || actionState(name).uncertain) return;
   const c = composer(name);
   if (c.pending.some((p) => !p.path)) return delivery('Still uploading…');
   const draft = c.draft;
@@ -946,20 +1089,17 @@ $('#input-row').onsubmit = async (e) => {
   $('#send-btn').disabled = true; $('#send-btn').textContent = 'Sending…';
   sessionDelivery(name, 'Sending to terminal…');
   try {
-    await post(`/api/sessions/${name}/keys`, { text });
-    if (c.draft === draft) c.draft = '';
-    c.pending = c.pending.filter((p) => !sent.includes(p));
-    sessionDelivery(name, 'Sent to terminal');
-    if (current !== name) return;
-    $('#input').value = c.draft; grow(); renderPending();
-    if (mode === 'read') { const el = $('#reader'); el.scrollTop = el.scrollHeight; setTimeout(pullReader, 400); }
-  } catch (err) {
-    sessionDelivery(name, err.status === 413
-      ? 'Message not sent. ' + err.message + ' Your draft is kept.'
-      : 'Delivery unconfirmed. Check output before retrying. ' + err.message, true);
+    await enqueueAction(name, { text }, () => {
+      if (c.draft === draft) c.draft = '';
+      c.pending = c.pending.filter((p) => !sent.includes(p));
+      sessionDelivery(name, 'Sent to terminal');
+      if (current !== name) return;
+      $('#input').value = c.draft; grow(); renderPending();
+      if (mode === 'read') { const el = $('#reader'); el.scrollTop = el.scrollHeight; setTimeout(pullReader, 400); }
+    });
   } finally {
     sending.delete(name);
-    if (current === name) { $('#send-btn').disabled = false; $('#send-btn').textContent = 'Send'; }
+    if (current === name) renderTaskControls();
   }
 };
 const grow = () => { const t = $('#input'); t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, innerHeight * .3) + 'px'; };
@@ -969,13 +1109,13 @@ $('#input').onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey && !touch)
 // --- attachments (photo library, camera or Files on iOS)
 const UPLOAD_TIMEOUT_MS = 60000;
 let fileOwner = null;
-$('#attach-btn').onclick = () => { if (current) { fileOwner = current; $('#file').click(); } };
+$('#attach-btn').onclick = () => { if (current && !endedTasks.has(current)) { fileOwner = current; $('#file').click(); } };
 $('#file').onchange = async () => {
   const files = [...$('#file').files];
   $('#file').value = '';
   const name = fileOwner || current;
   fileOwner = null;
-  if (!name) return;
+  if (!name || endedTasks.has(name)) return;
   const c = composer(name);
   for (const f of files) {
     if (state.uploadMaxMB && f.size > state.uploadMaxMB * 1048576) { if (current === name) flash(`${f.name} is over ${state.uploadMaxMB} MB`); continue; }
@@ -1047,13 +1187,13 @@ const canRecord = () => !!(window.MediaRecorder && navigator.mediaDevices && nav
 $('#mic-btn').onclick = async () => {
   if (rec) { if (rec.state === 'recording') rec.stop(); return; }
   const name = current;
-  if (!name || requestingMic) return;
+  if (!name || requestingMic || endedTasks.has(name)) return;
   requestingMic = true;
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
   catch { if (current === name) flash('Microphone blocked. Allow it for this site in Safari settings.'); return; }
   finally { requestingMic = false; }
-  if (current !== name) { stream.getTracks().forEach((t) => t.stop()); return; }
+  if (current !== name || endedTasks.has(name)) { stream.getTracks().forEach((t) => t.stop()); return; }
   const type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].find((t) => MediaRecorder.isTypeSupported(t)) || '';
   const r = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
   const chunks = [];
@@ -1096,7 +1236,7 @@ function micState(s) {
   const b = $('#mic-btn');
   b.classList.toggle('rec', s === 'rec');
   b.classList.toggle('busy', s === 'busy');
-  b.disabled = s === 'busy';
+  b.disabled = s === 'busy' || endedTasks.has(current);
   const secs = Math.floor((Date.now() - recStart) / 1000);
   $('#mic-label').textContent = s === 'rec' ? `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}` : s === 'busy' ? '…' : '';
   b.setAttribute('aria-label', s === 'rec' ? 'Stop and transcribe' : 'Dictate');
@@ -1108,18 +1248,21 @@ let ending = false;
 function disarm() { clearTimeout(armTimer); $('#kill-btn').classList.remove('armed'); $('#kill-btn').textContent = 'End'; }
 $('#kill-btn').onclick = async () => {
   const b = $('#kill-btn');
-  if (ending || !current) return;
+  if (ending || !current || endedTasks.has(current)) return;
   if (!b.classList.contains('armed')) { b.classList.add('armed'); b.textContent = 'Tap to end'; armTimer = setTimeout(disarm, 3000); return; }
   disarm();
   const name = current;
   ending = true; b.disabled = true; b.textContent = 'Ending…';
   try {
     await post(`/api/sessions/${name}/end`);
-    if (current === name) show('list');
-    composers.delete(name);
+    settleTask(name);
   } catch (err) {
-    sessionDelivery(name, 'Could not end task. It may still be running. ' + err.message, true);
-  } finally { ending = false; b.disabled = false; disarm(); }
+    if (err.status === 404 || err.status === 410) settleTask(name);
+    else if (!endedTasks.has(name)) {
+      sessionDelivery(name, 'End unconfirmed. Check task status; it may still be running. ' + err.message, true);
+      refresh();
+    }
+  } finally { ending = false; disarm(); renderTaskControls(); }
 };
 
 // ---------- boot ----------
@@ -1127,7 +1270,7 @@ pollTimer = setInterval(refresh, 3000);
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) return;
   refresh();
-  if (!current) return;
+  if (!current || endedTasks.has(current)) return;
   if (mode === 'live' && (!ws || ws.readyState > 1)) { clearTimeout(wsTimer); wsRetry = 0; connect(current); }
   else pullReader();
 });

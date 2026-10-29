@@ -31,6 +31,8 @@ const NOTIFY = config.notify && !!config.notifyCommand;
 tmux.configure({ sessionClosedCommand: config.sessionClosedCommand, uploadsDir: config.uploadsDir, stateDir: config.stateDir });
 const starts = require('./lib/starts').createStarter({ stateDir: config.stateDir, tmux });
 
+const actions = require('./lib/actions').createActions();
+
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 // ---------- status poller + alerts ----------
@@ -118,7 +120,7 @@ async function handle(req, res) {
   if (req.method === 'GET' && p === '/api/state') {
     const sessions = (await tmux.list()).map((s) => ({ ...s, status: statusOf.get(s.name) || (s.dead ? 'exited' : 'idle') }));
     return send(res, 200, { lanes: Object.keys(tmux.LANES), sessions, notify: NOTIFY, projectsRoot: config.projectsRoot,
-      startRecovery: true, transcribe: !!config.transcribeCommand, uploadMaxMB: config.uploadMaxMB });
+      startRecovery: true, actionEpoch: actions.epoch, transcribe: !!config.transcribeCommand, uploadMaxMB: config.uploadMaxMB });
   }
   if (req.method === 'GET' && p === '/api/projects') return send(res, 200, guard.listProjects(config));
 
@@ -143,8 +145,11 @@ async function handle(req, res) {
 
   const m = p.match(/^\/api\/sessions\/([^/]+)\/(keys|end|history|upload|size)$/);
   if (m) {
+    if (!guard.validSessionName(m[1])) return send(res, 404, { error: 'no such session' });
     const s = await requireSession(m[1]);
-    if (!s) return send(res, 404, { error: 'no such session' });
+    if (!s) return req.method === 'POST' && m[2] === 'end'
+      ? send(res, 200, { ok: true, absent: true })
+      : send(res, 404, { error: 'no such session' });
     if (req.method === 'GET' && m[2] === 'history') {
       const lines = Math.min(Math.max(Number(url.searchParams.get('lines')) || 2000, 50), 20000);
       let screen;
@@ -160,15 +165,21 @@ async function handle(req, res) {
     }
     if (req.method === 'POST' && m[2] === 'keys') {
       const body = await readJson(req);
+      if (s.dead) return send(res, 410, { error: 'session has ended' });
+      let execute;
       if (typeof body.key === 'string') {
         if (!tmux.KEYS.has(body.key) && !/^[0-9yn]$/.test(body.key)) return send(res, 400, { error: 'key not allowed' });
-        await tmux.sendKey(s.name, body.key);
-      }
-      else if (typeof body.text === 'string') {
+        execute = () => tmux.sendKey(s.name, body.key);
+      } else if (typeof body.text === 'string') {
         if (body.text.length > 20000) return send(res, 413, { error: 'Message is too long (maximum 20,000 characters). Shorten it and try again.' });
-        await tmux.sendText(s.name, body.text);
+        if (!body.text.trim()) return send(res, 400, { error: 'message is empty' });
+        execute = () => tmux.sendText(s.name, body.text);
+      } else return send(res, 400, { error: 'text or key required' });
+      // Legacy clients remain compatible, but have no receipt/deduplication guarantee.
+      if (body.actionId !== undefined || body.actionEpoch !== undefined || body.check) {
+        return send(res, 200, await actions.run(s.name, body, execute));
       }
-      else return send(res, 400, { error: 'text or key required' });
+      await execute();
       return send(res, 200, { ok: true });
     }
     if (req.method === 'POST' && m[2] === 'upload') {
@@ -184,7 +195,10 @@ async function handle(req, res) {
       return send(res, 200, { cols, rows });
     }
     if (req.method === 'POST' && m[2] === 'end') {
-      await tmux.kill(s.name);
+      try { await tmux.kill(s.name); } catch (err) {
+        // Another End may have won after our initial existence check.
+        if (await requireSession(s.name)) throw err;
+      }
       log('ended', s.name);
       return send(res, 200, { ok: true });
     }
@@ -226,7 +240,7 @@ const server = http.createServer((req, res) => {
   handle(req, res).catch((e) => {
     log('error', e.message);
     if (!res.headersSent) send(res, e.status || 500, { error: e.message,
-      ...(typeof e.code === 'string' && e.code.startsWith('START_') ? { code: e.code, requestId: e.requestId, name: e.sessionName } : {}) });
+      ...(typeof e.code === 'string' && (e.code.startsWith('START_') || e.code.startsWith('ACTION_')) ? { code: e.code, requestId: e.requestId, name: e.sessionName } : {}) });
   });
 });
 

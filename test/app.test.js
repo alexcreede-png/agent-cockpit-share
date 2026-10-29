@@ -12,7 +12,7 @@ test('public/app.js compiles as a script', () => {
   assert.doesNotThrow(() => new vm.Script(src, { filename: 'app.js' }));
 });
 
-function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, history = '', terminalHistory, historyError = false, createFlow = false, startRecovery = false, savedStarts = new Map(), storageDenied = false, cryptoDenied = false } = {}) {
+function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, history = '', terminalHistory, historyError = false, createFlow = false, startRecovery = false, savedStarts = new Map(), storageDenied = false, cryptoDenied = false, requestHook } = {}) {
   class Element {
     constructor() {
       this.children = []; this.dataset = {}; this.style = {}; this.value = ''; this.hidden = false;
@@ -27,6 +27,15 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
           this.classList[on ? 'add' : 'remove'](c); return on;
         },
       };
+    }
+    set innerHTML(value) {
+      this.children = []; this._text = '';
+      for (const match of value.matchAll(/class="([^"]+)"/g)) { const n = new Element(); n.className = match[1]; this.append(n); }
+    }
+    insertBefore(node, before) {
+      this.children = this.children.filter(n => n !== node);
+      const index = this.children.indexOf(before);
+      this.children.splice(index < 0 ? this.children.length : index, 0, node); node.parent = this;
     }
     get textContent() { return this._text || this.children.map(n => n.textContent).join(''); }
     set textContent(value) { this._text = value; this.children = []; }
@@ -55,7 +64,7 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
   };
   const calls = [], uploads = [], terminals = [], sockets = [], timers = [], observers = [];
   let historyText = history, failHistory = historyError;
-  const setup = { startRecovery, projectError: false, createError: false, loseResponse: false, errorCode: '', errorStatus: 503, badReply: false, holdCreate: false, finishCreate: null };
+  const setup = { startRecovery, projectError: false, createError: false, loseResponse: false, errorCode: '', errorStatus: 503, badReply: false, holdCreate: false, finishCreate: null, sessions: null };
   const exampleProjects = [{path:'/example/alpha',label:'Alpha project'},{path:'/example/beta',label:'Beta project'}];
   let finishSend;
   class XHR {
@@ -113,6 +122,7 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
     setInterval: () => 1, clearInterval() {},
     addEventListener() {}, innerHeight: 800, fetch: async (path, opts = {}) => {
       calls.push({ path, opts });
+      if (requestHook) { const response = await requestHook(path, opts); if (response) return response; }
       const responseHistory = !path.includes('format=reader') && terminalHistory !== undefined ? terminalHistory : historyText;
       if (voiceStall && path === '/api/transcribe') return new Promise((resolve, reject) => {
         opts.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
@@ -128,8 +138,8 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
         await new Promise(resolve => { setup.finishCreate = resolve; });
       }
       if (path === '/api/sessions' && setup.loseResponse) throw new Error('response lost');
-      const body = path === '/api/state' ? { startRecovery: setup.startRecovery, lanes: createFlow ? ['claude','codex','grok','agy','shell'] : [], sessions: [], transcribe: false }
-        : path === '/api/projects' ? exampleProjects : path === '/api/sessions' ? {name:'synthetic-created', ...(setup.badReply ? {} : {requestId: JSON.parse(opts.body).requestId}), reused: false} : {};
+      const body = path === '/api/state' ? { startRecovery: setup.startRecovery, lanes: createFlow ? ['claude','codex','grok','agy','shell'] : [], sessions: setup.sessions ?? [...new Set(['a','b','synthetic-created',vm.runInContext('current', context)].filter(Boolean))].map(name => ({name,lane:'grok',project:'/example/project',status:'idle'})), actionEpoch: 'synthetic-epoch', transcribe: false }
+        : path.endsWith('/keys') ? {ok:true,actionId:JSON.parse(opts.body).actionId} : path === '/api/projects' ? exampleProjects : path === '/api/sessions' ? {name:'synthetic-created', ...(setup.badReply ? {} : {requestId: JSON.parse(opts.body).requestId}), reused: false} : {};
       const failed = (setup.projectError && path === '/api/projects') || ((setup.createError || setup.errorCode) && path === '/api/sessions') || (failHistory && path.includes('/history')) || (failSend && path === '/api/sessions/a/keys') || (failEnd && path === '/api/sessions/a/end');
       return { ok: !failed, status: failed ? (path === '/api/sessions' && (setup.errorCode || setup.createError) ? setup.errorStatus : failSendStatus) : 200,
         headers: { get: () => path.includes('/history') && typeof responseHistory === 'string' ? 'text/plain' : 'application/json' },
@@ -327,7 +337,7 @@ test('failed send retains the draft and failed end keeps the session open', asyn
   await h.el('#kill-btn').click();
   assert.equal(vm.runInContext('current', h.context), 'a');
   assert.equal(h.el('#term-view').hidden, false);
-  assert.match(h.el('#delivery').textContent, /Could not end task/);
+  assert.match(h.el('#delivery').textContent, /End unconfirmed/);
 });
 
 test('project identity is spoken plainly while the internal name remains in the title', () => {
@@ -475,7 +485,7 @@ test('state success cannot mask failed Read capture or retain Live connection du
   assert.equal(h.el('#connection-state').dataset.state,'offline');
   await vm.runInContext('refresh()',h.context);
   assert.equal(h.el('#connection-state').dataset.state,'offline');
-  assert.equal(h.el('#t-status').textContent,'gone', 'missing session is explicitly gone');
+  assert.equal(h.el('#t-status').textContent,'Idle', 'successful state does not mask failed capture');
   assert.match(h.el('#reader').textContent,/unavailable/);
   vm.runInContext("setMode('live')",h.context);
   const socket=h.sockets.at(-1); socket.readyState=1; socket.onopen();
@@ -948,9 +958,9 @@ test('output labels follow Read/Live and selected-task guards ignore old source 
 });
 
 
-test('Respond navigation stays open; Enter closes only after success and failed keys remain retryable', async () => {
+test('Respond navigation stays open; Enter closes only after success and rejected keys remain retryable', async () => {
   for (const failSend of [false,true]) {
-    const h=frontend({failSend,history:'A setup question'}); await tick(); openNewAssistant(h); await tick();
+    const h=frontend({failSend,failSendStatus:400,history:'A setup question'}); await tick(); openNewAssistant(h); await tick();
     vm.runInContext("renderTermIdentity({name:'a',lane:'grok',status:'needs-you'})",h.context);
     h.el('#startup-respond').click();
     const up=h.el('#keys').children.find(b=>b.textContent==='↑');
@@ -963,7 +973,7 @@ test('Respond navigation stays open; Enter closes only after success and failed 
     assert.equal(h.el('#keys').classList.contains('short-open'),failSend);
     assert.equal(enter.disabled,false);
     if (!failSend) assert.equal(h.context.document.activeElement,h.el('#startup-respond'),'focus returns to the Respond button that opened controls');
-    const sent=h.calls.filter(c=>c.path.endsWith('/keys')).map(c=>JSON.parse(c.opts.body));
+    const sent=h.calls.filter(c=>c.path.endsWith('/keys')).map(c=>({key:JSON.parse(c.opts.body).key}));
     assert.deepEqual(sent,[{key:'Up'},{key:'Enter'}],'only explicitly chosen response keys are sent');
   }
 });
@@ -1003,4 +1013,229 @@ test('a conversation response from before Needs you cannot replace the current q
   assert.equal(h.el('#reader').textContent,question);
   assert.equal(h.el('#output-source').textContent,'Terminal output');
   assert.equal(h.el('#startup-note').hidden,false);
+});
+
+// Interruption regressions use the actual HTTP handler and actual tmux input queue.
+// Only HTTP/process transports are synthetic; no live sessions or network exist.
+const { actionFixture } = require('./helpers/actions-harness');
+const keyButton = (h, key) => h.el('#keys').children.find(b => b.dataset.key === key);
+const terminalInputs = f => f.machine.calls.filter(c => c[0] === 'send-keys').map(c => [c[c.indexOf('-t') + 1], c.at(-1)]);
+
+test('tap order survives delayed first HTTP arrival; another task proceeds and composer shares the queue', async t => {
+  const f = actionFixture(t); let release, held = false;
+  const h = frontend({ requestHook: async (url, opts) => {
+    if (!held && url === '/api/sessions/a/keys') {
+      held = true; await new Promise(r => { release = r; });
+    }
+    return f.fetch(url, opts);
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+  const up = keyButton(h, 'Up').click();
+  const enter = keyButton(h, 'Enter').click();
+  h.el('#input').value = 'Composer follows keys'; h.el('#input').oninput();
+  const send = h.el('#input-row').onsubmit({ preventDefault() {} });
+  await tick();
+  assert.equal(h.calls.filter(c => c.path === '/api/sessions/a/keys').length, 1, 'Enter cannot overtake delayed Up');
+  vm.runInContext("openTerm('b')", h.context); await tick();
+  await keyButton(h, 'Down').click();
+  assert.deepEqual(terminalInputs(f), [['=b:', 'Down']], 'other task is independent');
+  release(); await Promise.all([up, enter, send]);
+  assert.deepEqual(terminalInputs(f), [['=b:', 'Down'], ['=a:', 'Up'], ['=a:', 'Enter'], ['=a:', 'Enter']]);
+  const payloads = h.calls.filter(c => c.path === '/api/sessions/a/keys').map(c => JSON.parse(c.opts.body));
+  assert.deepEqual(payloads.map(b => b.key || b.text), ['Up', 'Enter', 'Composer follows keys']);
+  assert.equal(new Set(payloads.map(b => b.actionId)).size, 3);
+  assert.equal(vm.runInContext('current', h.context), 'b');
+});
+
+test('lost Enter acknowledgement blocks repeated Enter, cancels queued composer and checks without execution', async t => {
+  const f = actionFixture(t); let lost = false, captured;
+  const h = frontend({ requestHook: async (url, opts) => {
+    const response = await f.fetch(url, opts);
+    if (!lost && url.endsWith('/keys')) { lost = true; captured = JSON.parse(opts.body); throw new Error('response lost after execution'); }
+    return response;
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+  const enter = keyButton(h, 'Enter').click();
+  h.el('#input').value = 'Draft stays'; h.el('#input').oninput();
+  const send = h.el('#input-row').onsubmit({ preventDefault() {} });
+  await Promise.all([enter, send]);
+  assert.match(h.el('#delivery').textContent, /Delivery unconfirmed.*do not repeat Enter/);
+  assert.doesNotMatch(h.el('#delivery').textContent, /Key failed/);
+  assert.equal(keyButton(h, 'Enter').disabled, true); assert.equal(h.el('#send-btn').disabled, true);
+  await keyButton(h, 'Enter').click(); await h.el('#input-row').onsubmit({ preventDefault() {} });
+  assert.deepEqual(terminalInputs(f), [['=a:', 'Enter']]);
+  assert.equal(h.el('#input').value, 'Draft stays');
+  await vm.runInContext('checkDelivery.onclick()', h.context);
+  assert.deepEqual(terminalInputs(f), [['=a:', 'Enter']]);
+  assert.equal(h.el('#input').value, 'Draft stays', 'cancelled composer was never delivered');
+  assert.match(h.el('#delivery').textContent, /Delivery confirmed/);
+  const checks = h.calls.filter(c => c.path.endsWith('/keys')).map(c => JSON.parse(c.opts.body));
+  assert.deepEqual(checks, [captured, { ...captured, check: true }]);
+});
+
+test('uncertain navigation cancels queued Enter and composer; restart checks remain unconfirmed until review', async t => {
+  const f = actionFixture(t); let lost = false;
+  const h = frontend({ requestHook: async (url, opts) => {
+    const response = await f.fetch(url, opts);
+    if (!lost && url.endsWith('/keys')) { lost = true; throw new Error('lost acknowledgement'); }
+    return response;
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+  const up = keyButton(h, 'Up').click(), enter = keyButton(h, 'Enter').click();
+  await Promise.all([up, enter]);
+  assert.deepEqual(terminalInputs(f), [['=a:', 'Up']]);
+  f.restart(); await vm.runInContext('checkDelivery.onclick()', h.context);
+  assert.match(h.el('#delivery').textContent, /still unconfirmed.*server restart/);
+  assert.equal(keyButton(h, 'Enter').disabled, true);
+  await vm.runInContext('refresh()', h.context);
+  assert.equal(keyButton(h, 'Enter').disabled, true, 'polling cannot clear uncertainty');
+  vm.runInContext('reviewDelivery.onclick()', h.context);
+  assert.match(h.el('#delivery').textContent, /Previous delivery remains unconfirmed/);
+  assert.equal(keyButton(h, 'Enter').disabled, false);
+  assert.deepEqual(terminalInputs(f), [['=a:', 'Up']], 'review does not send input');
+});
+
+test('explicit key rejection cancels queued Enter with definite not-sent feedback', async () => {
+  const h = frontend({ failSend: true, failSendStatus: 400 }); await tick();
+  vm.runInContext("openTerm('a')", h.context); await tick();
+  const up = keyButton(h, 'Up').click(), enter = keyButton(h, 'Enter').click();
+  await tick(); h.finishSend(); await Promise.all([up, enter]);
+  assert.equal(h.calls.filter(c => c.path.endsWith('/keys')).length, 1);
+  assert.match(h.el('#delivery').textContent, /Key not sent/);
+  assert.doesNotMatch(h.el('#delivery').textContent, /unconfirmed/);
+  assert.equal(keyButton(h, 'Enter').disabled, false);
+});
+
+test('lost End response then confirmed absence settles, preserves draft/output and stops stale retries', async t => {
+  const f = actionFixture(t); f.machine.screen = 'Last output to keep';
+  let lost = false;
+  const h = frontend({ requestHook: async (url, opts) => {
+    const response = await f.fetch(url, opts);
+    if (!lost && url.endsWith('/end')) { lost = true; throw new Error('end response lost'); }
+    return response;
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+  h.el('#input').value = 'Unsent draft'; h.el('#input').oninput();
+  assert.equal(h.el('#reader').textContent, 'Last output to keep');
+  h.el('#kill-btn').click(); await h.el('#kill-btn').click(); await tick();
+  await vm.runInContext('refresh()', h.context);
+  assert.match(h.el('#t-status').textContent, /Ended.*unavailable/);
+  assert.equal(h.el('#input').value, 'Unsent draft');
+  assert.equal(h.el('#reader').textContent, 'Last output to keep');
+  assert.equal(vm.runInContext('readTimer', h.context), null);
+  assert.equal(h.el('#send-btn').disabled, true); assert.equal(keyButton(h, 'Enter').disabled, true);
+  assert.equal(h.el('#kill-btn').disabled, true); assert.equal(h.el('#mode-btn').disabled, true);
+  assert.doesNotMatch(h.el('#delivery').textContent, /still be running|Retrying/);
+  assert.match(h.el('#conn-note').textContent, /Use Back/);
+  const count = h.calls.length;
+  await vm.runInContext('pullReader(); connect(current); fitSession()', h.context);
+  await keyButton(h, 'Enter').click(); await h.el('#kill-btn').click();
+  await h.el('#input-row').onsubmit({ preventDefault() {} });
+  assert.equal(h.calls.length, count, 'stale callbacks and task controls do not retry');
+});
+
+test('definitive history 404 settles independently of state; ended Live keeps output and suppresses queued reconnect', async () => {
+  const h = frontend(); await tick(); vm.runInContext("openTerm('a'); setMode('live')", h.context);
+  const socket = h.sockets.at(-1), terminal = h.terminals.at(-1);
+  socket.readyState = 1; socket.onopen(); socket.onmessage({ data: 'Saved live output' });
+  socket.onclose(); const retry = h.timers.find(t => t.ms === 1000 && !t.canceled);
+  vm.runInContext("settleTask('a')", h.context); retry.fn();
+  assert.deepEqual(terminal.writes, ['Saved live output']); assert.equal(terminal.disposed, undefined);
+  assert.equal(h.sockets.length, 1); assert.equal(vm.runInContext('wsTimer', h.context), null);
+
+  const missing = frontend({ historyError: true, failSendStatus: 404 }); await tick();
+  vm.runInContext("openTerm('a')", missing.context); await tick();
+  assert.equal(vm.runInContext("endedTasks.has('a')", missing.context), true);
+  assert.equal(missing.el('#send-btn').disabled, true);
+  assert.doesNotMatch(missing.el('#reader-state').textContent, /Retrying/);
+});
+
+test('composer paste/Enter completes before later quick keys on the same task', async t => {
+  const f = actionFixture(t); let release, held = false;
+  const h = frontend({ requestHook: async (url, opts) => {
+    if (!held && url.endsWith('/keys')) { held = true; await new Promise(r => { release = r; }); }
+    return f.fetch(url, opts);
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+  h.el('#input').value = 'Message first'; h.el('#input').oninput();
+  const send = h.el('#input-row').onsubmit({ preventDefault() {} });
+  const up = keyButton(h, 'Up').click(), enter = keyButton(h, 'Enter').click();
+  await tick();
+  assert.equal(h.calls.filter(c => c.path.endsWith('/keys')).length, 1);
+  release(); await Promise.all([send, up, enter]);
+  assert.deepEqual(terminalInputs(f), [['=a:', 'Enter'], ['=a:', 'Up'], ['=a:', 'Enter']]);
+  assert.equal(h.el('#input').value, '');
+});
+
+test('late lost delivery after confirmed absence cannot replace ended feedback or clear the draft', async t => {
+  const f = actionFixture(t); let release, reached;
+  const pendingResponse = new Promise(r => { reached = r; });
+  const h = frontend({ requestHook: async (url, opts) => {
+    const response = await f.fetch(url, opts);
+    if (url.endsWith('/keys')) { await new Promise(r => { release = r; reached(); }); throw new Error('late response lost'); }
+    return response;
+  } });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+  h.el('#input').value = 'Keep this draft'; h.el('#input').oninput();
+  const send = h.el('#input-row').onsubmit({ preventDefault() {} }); await pendingResponse;
+  f.machine.sessions.delete('a'); await vm.runInContext('refresh()', h.context);
+  release(); await send;
+  assert.equal(h.el('#input').value, 'Keep this draft');
+  assert.match(h.el('#delivery').textContent, /Task ended or unavailable/);
+  assert.equal(h.el('#send-btn').disabled, true);
+  assert.equal(vm.runInContext("actionState('a').uncertain", h.context), null);
+});
+
+test('a successful HTTP response with an unmatched receipt cannot release queued Enter', async () => {
+  const h = frontend({ requestHook: async url => url.endsWith('/keys') ? {
+    ok: true, headers: { get: () => 'application/json' }, json: async () => ({ ok: true, actionId: 'other-action' }),
+  } : null });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+  await Promise.all([keyButton(h, 'Up').click(), keyButton(h, 'Enter').click()]);
+  assert.equal(h.calls.filter(c => c.path.endsWith('/keys')).length, 1);
+  assert.match(h.el('#delivery').textContent, /Delivery unconfirmed/);
+  assert.equal(keyButton(h, 'Enter').disabled, true);
+  await vm.runInContext('checkDelivery.onclick()', h.context);
+  assert.match(h.el('#delivery').textContent, /still unconfirmed.*receipt did not match/);
+  assert.equal(keyButton(h, 'Enter').disabled, true);
+});
+
+test('reload during in-flight input keeps controls blocked without persisting or resending input', async () => {
+  const h = frontend(); await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+  const enter = keyButton(h, 'Enter').click(); await tick();
+  const markerKey = 'cockpit-pending-actions-v1';
+  assert.deepEqual(JSON.parse(h.savedStarts.get(markerKey)), ['a'], 'marker reserved before acknowledgement');
+  const reloaded = frontend({ savedStarts: h.savedStarts }); await tick();
+  vm.runInContext("openTerm('a')", reloaded.context); await tick();
+  assert.match(reloaded.el('#delivery').textContent, /unconfirmed after reload.*cannot check/);
+  assert.equal(keyButton(reloaded, 'Enter').disabled, true);
+  assert.equal(reloaded.el('#send-btn').disabled, true);
+  assert.equal(reloaded.calls.filter(c => c.path.endsWith('/keys')).length, 0);
+  await vm.runInContext('checkDelivery.onclick()', reloaded.context);
+  assert.equal(reloaded.calls.filter(c => c.path.endsWith('/keys')).length, 0, 'missing original reference cannot be checked or resent');
+  vm.runInContext('reviewDelivery.onclick()', reloaded.context);
+  assert.equal(keyButton(reloaded, 'Enter').disabled, false);
+  assert.match(reloaded.el('#delivery').textContent, /Previous delivery remains unconfirmed/);
+  h.finishSend(); await enter;
+});
+
+test('unavailable action recovery storage refuses input before any terminal request', async () => {
+  const h = frontend({ storageDenied: true }); await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+  await keyButton(h, 'Enter').click();
+  assert.equal(h.calls.filter(c => c.path.endsWith('/keys')).length, 0);
+  assert.match(h.el('#delivery').textContent, /Key not sent.*reload recovery is unavailable/);
+});
+
+test('a state request begun before opening a task cannot settle that newly opened task as absent', async () => {
+  let release, first = true;
+  const h = frontend({ requestHook: async url => {
+    if (url !== '/api/state' || !first) return null;
+    first = false; await new Promise(r => { release = r; });
+    return { ok: true, headers: { get: () => 'application/json' }, json: async () => ({ sessions: [], lanes: [], actionEpoch: 'synthetic-epoch' }) };
+  } });
+  vm.runInContext("openTerm('a')", h.context);
+  release(); await tick();
+  assert.equal(vm.runInContext("endedTasks.has('a')", h.context), false);
+  await vm.runInContext('refresh()', h.context);
+  assert.equal(h.el('#send-btn').disabled, false);
 });
