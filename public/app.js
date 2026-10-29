@@ -728,7 +728,7 @@ function openTerm(name, session = state.sessions.find((s) => s.name === name), j
   $('#input').value = c.draft;
   grow();
   renderPending();
-  delivery(c.feedback.text, c.feedback.error);
+  delivery(c.feedback.text, c.feedback.error, c.feedback.openBrowser);
   if (actionState(name).uncertain?.reloaded) sessionDelivery(name, 'Previous delivery is unconfirmed after reload. This page cannot check its receipt. Review current output before enabling new actions; do not repeat Enter automatically.', true);
   renderTaskControls();
   disarm();
@@ -1168,13 +1168,21 @@ $('#keys').onkeydown = (event) => {
   closeShortKeys();
 };
 
-function delivery(text, error = false) {
+function delivery(text, error = false, openBrowser = false) {
   const el = $('#delivery');
   el.textContent = text; el.hidden = !text; el.classList.toggle('error', error);
+  if (text && openBrowser) {
+    const link = document.createElement('a');
+    link.className = 'browser-handoff'; link.textContent = 'Open in browser';
+    // The task route is shareable; credentials, drafts and query strings are not.
+    link.href = `${location.origin}${location.pathname}${location.hash}`;
+    link.target = '_blank'; link.rel = 'noopener noreferrer';
+    el.append(link);
+  }
 }
-function sessionDelivery(name, text, error = false) {
-  composer(name).feedback = { text, error };
-  if (current === name) delivery(text, error);
+function sessionDelivery(name, text, error = false, openBrowser = false) {
+  composer(name).feedback = { text, error, openBrowser };
+  if (current === name) delivery(text, error, openBrowser);
 }
 const sending = new Set();
 // Keep the draft visible until delivery succeeds. Never automatically retry an uncertain send.
@@ -1407,6 +1415,17 @@ cancelDictation.onclick = () => {
   const name = current; discardDictation(name);
   if (name) sessionDelivery(name, 'Dictation discarded. Late text will not be added.');
 };
+function microphonePermissionDenied(error) {
+  return error?.name === 'NotAllowedError' || error?.name === 'SecurityError';
+}
+function microphoneFailureMessage(error) {
+  if (microphonePermissionDenied(error)) return framed
+    ? 'Microphone access is unavailable inside this app. Open Cockpit in your browser to try Dictate there. Your draft stays on this page.'
+    : 'Microphone access was denied. Check this site’s microphone permission in your browser, then try Dictate again.';
+  if (error?.name === 'NotFoundError') return 'No microphone was found. Connect one or type your message.';
+  if (error?.name === 'NotReadableError') return 'Microphone could not start. Check that it is connected and available, then try Dictate again.';
+  return 'Microphone did not start. Try Dictate again or type your message.';
+}
 $('#mic-btn').onclick = async () => {
   if (rec) { if (rec.state === 'recording') rec.stop(); return; }
   const name = current;
@@ -1417,10 +1436,17 @@ $('#mic-btn').onclick = async () => {
   try { const bytes = new Uint8Array(16); crypto.getRandomValues(bytes); id = Array.from(bytes, x => x.toString(16).padStart(2, '0')).join(''); }
   catch { return sessionDelivery(name, 'Safe dictation identity unavailable. Recording not started.', true); }
   const epoch = state.dictationEpoch, generation = micGeneration;
+  const feedbackBeforePermission = composer(name).feedback;
   requestingMic = true;
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
-  catch { if (current === name) flash('Microphone blocked. Allow it for this site in Safari settings.'); return; }
+  catch (error) {
+    if (current === name && generation === micGeneration && !ending && !endedTasks.has(name)
+        && composer(name).feedback === feedbackBeforePermission) {
+      sessionDelivery(name, microphoneFailureMessage(error), true, framed && microphonePermissionDenied(error));
+    }
+    return;
+  }
   finally { requestingMic = false; }
   if (current !== name || endedTasks.has(name) || ending || generation !== micGeneration) { stream.getTracks().forEach((t) => t.stop()); return; }
   const type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].find((t) => MediaRecorder.isTypeSupported(t)) || '';

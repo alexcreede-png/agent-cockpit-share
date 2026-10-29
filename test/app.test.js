@@ -12,7 +12,7 @@ test('public/app.js compiles as a script', () => {
   assert.doesNotThrow(() => new vm.Script(src, { filename: 'app.js' }));
 });
 
-function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, dictation = false, history = '', terminalHistory, historyError = false, createFlow = false, startRecovery = false, savedStarts = new Map(), storageDenied = false, cryptoDenied = false, requestHook, initialHash = '' } = {}) {
+function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voiceStall = false, voiceBodyStall = false, dictation = false, history = '', terminalHistory, historyError = false, createFlow = false, startRecovery = false, savedStarts = new Map(), storageDenied = false, cryptoDenied = false, requestHook, initialHash = '', embedded = false } = {}) {
   class Element {
     constructor() {
       this.children = []; this.dataset = {}; this.style = {}; this.value = ''; this.hidden = false;
@@ -101,8 +101,8 @@ function frontend({ failSend = false, failSendStatus = 503, failEnd = false, voi
   }
   const windowEvents = new Map();
   const window = { addEventListener(type, fn) { const listeners = windowEvents.get(type) || []; listeners.push(fn); windowEvents.set(type, listeners); }, MediaRecorder: voiceStall || voiceBodyStall || dictation ? FakeMediaRecorder : null, visualViewport: null };
-  window.parent = window;
-  const location = { hash: initialHash, protocol: 'https:', host: 'example.test' };
+  window.parent = embedded ? { postMessage() {} } : window;
+  const location = { hash: initialHash, protocol: 'https:', host: 'example.test', origin: 'https://example.test', pathname: '/', search: '?unused=do-not-transfer' };
   const routeHistory = [initialHash]; let routeIndex = 0;
   const navHistory = {
     replaceState(state, title, hash) { routeHistory[routeIndex] = location.hash = hash; },
@@ -2038,4 +2038,80 @@ test('confirmed new task survives Back and Forward while task-state refresh fail
     assert.equal(vm.runInContext('activeView',h.context),'list');
     assert.equal(h.context.location.hash,'#');
   }
+});
+
+
+test('microphone failures give persistent, cause-specific recovery without losing or sending the draft', async () => {
+  for (const [name, expected] of [
+    ['NotAllowedError', /microphone permission.*browser/i],
+    ['SecurityError', /microphone permission.*browser/i],
+    ['NotFoundError', /No microphone was found/],
+    ['NotReadableError', /connected and available/],
+    ['AbortError', /Try Dictate again or type/],
+  ]) {
+    const h = frontend({ dictation: true });
+    await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+    h.el('#input').value = 'Keep my draft'; h.el('#input').oninput();
+    h.setup.micPermission = Promise.reject(Object.assign(new Error('synthetic'), {name}));
+    await h.el('#mic-btn').click();
+    assert.match(h.el('#delivery').textContent, expected);
+    assert.equal(h.el('#delivery').hidden, false);
+    assert.doesNotMatch(h.el('#delivery').textContent, /Safari settings/);
+    assert.equal(h.el('#input').value, 'Keep my draft');
+    assert.equal(h.el('#delivery').querySelector('.browser-handoff'), null);
+    assert.equal(vm.runInContext('requestingMic', h.context), false);
+    assert.equal(vm.runInContext('rec', h.context), null);
+    assert.equal(h.calls.filter(c => c.path === '/api/transcribe' || c.path.endsWith('/keys')).length, 0);
+  }
+});
+
+test('embedded microphone denial offers a task-specific browser handoff and keeps the draft local', async () => {
+  const h = frontend({ dictation: true, embedded: true });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+  h.el('#input').value = 'Private synthetic draft'; h.el('#input').oninput();
+  h.setup.micPermission = Promise.reject(Object.assign(new Error('synthetic'), {name:'NotAllowedError'}));
+  await h.el('#mic-btn').click();
+  assert.match(h.el('#delivery').textContent, /inside this app/);
+  assert.match(h.el('#delivery').textContent, /draft stays on this page/);
+  let link = h.el('#delivery').querySelector('.browser-handoff');
+  assert.ok(link); assert.equal(link.href, 'https://example.test/#a');
+  assert.equal(link.target, '_blank'); assert.equal(link.rel, 'noopener noreferrer');
+  assert.equal(h.el('#input').value, 'Private synthetic draft');
+  vm.runInContext("openTerm('b')", h.context);
+  assert.equal(h.el('#delivery').querySelector('.browser-handoff'), null);
+  vm.runInContext("openTerm('a')", h.context);
+  link = h.el('#delivery').querySelector('.browser-handoff');
+  assert.equal(link.href, 'https://example.test/#a');
+  assert.equal(h.el('#input').value, 'Private synthetic draft');
+});
+
+test('late rejected microphone permission cannot replace feedback after End or leaving and returning', async () => {
+  for (const action of ['end', 'switch-return']) {
+    const h = frontend({ dictation: true });
+    await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+    let reject; h.setup.micPermission = new Promise((resolve, fail) => { reject = fail; });
+    const request = h.el('#mic-btn').click();
+    if (action === 'end') { h.el('#kill-btn').click(); await h.el('#kill-btn').click(); }
+    else vm.runInContext("openTerm('b'); openTerm('a'); sessionDelivery('a', 'New visit feedback')", h.context);
+    const before = [h.el('#delivery').textContent, h.el('#conn-note').textContent];
+    reject(Object.assign(new Error('synthetic'), {name:'NotAllowedError'})); await request;
+    assert.deepEqual([h.el('#delivery').textContent, h.el('#conn-note').textContent], before);
+    assert.equal(vm.runInContext('rec', h.context), null);
+  }
+});
+
+
+test('a delayed microphone rejection cannot overwrite a newer send receipt', async () => {
+  const h = frontend({ dictation: true });
+  await tick(); vm.runInContext("openTerm('a')", h.context); await tick();
+  h.el('#input').value = 'Send this while permission is pending'; h.el('#input').oninput();
+  let reject; h.setup.micPermission = new Promise((resolve, fail) => { reject = fail; });
+  const permission = h.el('#mic-btn').click();
+  const send = h.el('#input-row').onsubmit({preventDefault(){}});
+  await tick(); h.finishSend(); await send;
+  const receipt = h.el('#delivery').textContent;
+  assert.match(receipt, /Sent to terminal/);
+  reject(Object.assign(new Error('synthetic'), {name:'NotAllowedError'})); await permission;
+  assert.equal(h.el('#delivery').textContent, receipt);
+  assert.equal(h.el('#input').value, '');
 });

@@ -176,6 +176,8 @@ viewport panning, an active usage warning, desktop width, and leaving the cockpi
 
 ## Dictation recovery
 
+Microphone failures stay visible beside the message draft. Permission-denied guidance uses the current context: an embedded page offers **Open in browser**, while a direct page points to that site’s browser microphone permission. The browser link opens the same task without transferring credentials, query strings or draft text; the draft stays in the original page. Missing or unavailable microphones receive their own guidance. No browser or host permission is changed automatically.
+
 Keep the page open after recording. Accepted jobs are checked automatically with read-only requests every two seconds while the page is visible. A network failure stops those checks and offers **Check dictation**, which only reads the original job's status;
 when an upload is unknown, **Retry upload** checks again before uploading the same recording
 with the same identity. A queued job can outlast the browser's 60-second request timeout.
