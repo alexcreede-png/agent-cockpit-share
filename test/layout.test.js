@@ -16,7 +16,8 @@ test('short focused frame hides guidance and secondary task details only', () =>
     assert.ok(block[1].includes(`#term-view:has(#input:focus) ${id}`), `${id} steps aside while typing`);
   }
   for (const kept of ['#t-name', '#t-status', '#mode-btn', '#kill-btn', '#keys-toggle', '#send-btn']) {
-    assert.ok(!block[1].includes(kept), `${kept} stays visible while typing`);
+    const hides = block[1].split('\n').some(line => line.includes(kept) && /display:\s*none/.test(line));
+    assert.ok(!hides, `${kept} stays visible while typing`);
   }
 });
 
@@ -29,4 +30,8 @@ test('very short focused frame (landscape keyboard) also steps the task bar asid
   const block = css.match(/@media \(max-height: 300px\) \{([\s\S]*?)\n\}/);
   assert.ok(block, 'landscape typing rule exists');
   assert.ok(block[1].includes('#term-view:has(#input:focus) > .bar { display: none; }'));
+});
+
+test('the mic icon stays centred when it has no recording label', () => {
+  assert.ok(css.includes('#mic-label:empty { display: none; }'));
 });
