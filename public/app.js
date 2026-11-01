@@ -1160,6 +1160,9 @@ function resumeRespond() {
   const pending = pendingRespond;
   pendingRespond = null;
   if (!pending || pending.task !== current || mode !== 'read' || !needsResponse) return;
+  // A newer action wins: if focus moved (for example into the message box), stay put.
+  const active = document.activeElement;
+  if (active && active !== document.body && active !== pending.trigger) return;
   if (!$('#keys').classList.contains('short-open')) openResponseControls(pending.trigger);
 }
 function closeShortKeys(restoreFocus = true) {

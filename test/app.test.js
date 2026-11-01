@@ -1927,6 +1927,10 @@ test('mode changes and task navigation invalidate question reads, queued keys an
   await queued; await tick();
   assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length,0,'mode change cancels an undispatched queued response');
   vm.runInContext("setMode('read')",h.context); await tick();
+  vm.runInContext("setMode('live')",h.context); h.el('#startup-respond').click(); h.el('#input').focus();
+  reply(reads.at(-1), 'Question while typing'); await tick();
+  assert.equal(h.el('#keys').classList.contains('short-open'),false,'typing after Respond keeps focus in the message box');
+  assert.equal(h.context.document.activeElement,h.el('#input'));
   vm.runInContext("setMode('live')",h.context); h.el('#startup-respond').click(); vm.runInContext("setMode('live')",h.context);
   reply(reads.at(-1), 'Question after leaving Read'); await tick();
   assert.equal(h.el('#keys').classList.contains('short-open'),false,'returning to Live cancels the pending Respond');
