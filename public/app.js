@@ -787,7 +787,7 @@ function setMode(m) {
   stopReader(); closeShortKeys(false);
   if (m !== 'read') pendingRespond = null;
   mode = m; store.set('cockpit-mode', m);
-  $('#mode-btn').textContent = m === 'read' ? 'Live' : 'Read';
+  $('#mode-btn').textContent = m === 'read' ? 'Show live' : 'Show reading';
   $('#mode-btn').setAttribute('aria-label', m === 'read' ? 'Switch to live terminal' : 'Switch to readable output');
   $('#reader').hidden = m !== 'read';
   $('#answer-start').hidden = true;

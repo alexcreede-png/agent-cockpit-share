@@ -946,8 +946,10 @@ test('Needs you preserves the raw setup question and opens Respond controls only
 
 test('output labels follow Read/Live and selected-task guards ignore old source responses', async () => {
   const h=frontend({history:ownedConversation(shownMessages)}); await tick(); openNewAssistant(h); await tick();
+  assert.equal(h.el('#mode-btn').textContent,'Show live','the mode button names its action, not a bare mode');
   assert.equal(h.el('#output-source').textContent,'Conversation');
   vm.runInContext("setMode('live')",h.context);
+  assert.equal(h.el('#mode-btn').textContent,'Show reading');
   assert.equal(h.el('#output-source').textContent,'Live terminal');
   assert.equal(h.el('#answer-start').hidden,true);
   const fetch=h.context.fetch;
