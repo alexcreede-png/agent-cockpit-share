@@ -24,3 +24,9 @@ test('Controls stays in the message row so response keys remain reachable', () =
   const row = html.match(/<form id="input-row"[\s\S]*?<\/form>/)[0];
   assert.ok(row.includes('id="keys-toggle"'));
 });
+
+test('very short focused frame (landscape keyboard) also steps the task bar aside', () => {
+  const block = css.match(/@media \(max-height: 300px\) \{([\s\S]*?)\n\}/);
+  assert.ok(block, 'landscape typing rule exists');
+  assert.ok(block[1].includes('#term-view:has(#input:focus) > .bar { display: none; }'));
+});

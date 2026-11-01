@@ -195,6 +195,11 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
   #term-view:has(#input:focus) #output-source { display: none; }
   #term-view:has(#input:focus) > .bar { min-height: 44px; }
 }
+/* Landscape phone with the keyboard up leaves room for little more than the message
+   row; the task bar returns as soon as the message box loses focus. */
+@media (max-height: 300px) {
+  #term-view:has(#input:focus) > .bar { display: none; }
+}
 @media (max-height: 440px) {
   .bar { min-height: 50px; }
   .input-row { padding-block: 3px; }
