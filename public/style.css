@@ -185,6 +185,16 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
   .keys { flex-wrap: nowrap; }
   .keys.expanded { flex-wrap: wrap; }
 }
+/* Typing on a phone: the keyboard leaves a short frame, so guidance and
+   secondary task details step aside while the message box has focus.
+   Controls in the message row still opens the response keys. */
+@media (max-height: 520px) {
+  #term-view:has(#input:focus) #startup-note,
+  #term-view:has(#input:focus) #reader-tools,
+  #term-view:has(#input:focus) #t-context,
+  #term-view:has(#input:focus) #output-source { display: none; }
+  #term-view:has(#input:focus) > .bar { min-height: 44px; }
+}
 @media (max-height: 440px) {
   .bar { min-height: 50px; }
   .input-row { padding-block: 3px; }
