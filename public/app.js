@@ -141,12 +141,15 @@ function renderTermIdentity(s, name = current) {
   pill.textContent = s ? STATUS_LABEL[s.status] || s.status : 'starting';
   const attentionChanged = needsResponse !== (s?.status === 'needs-you');
   needsResponse = s?.status === 'needs-you';
-  $('#keys-toggle').textContent = needsResponse ? 'Respond' : 'Controls';
+  // One Respond (in the task note); the message-row button keeps one name so it
+  // is never mistaken for sending the typed message.
+  $('#keys-toggle').textContent = 'Controls';
   if (attentionChanged && current) {
     const wasReading = mode === 'read' && (readTimer !== null || readerBusy);
     actionState(current).generation++; // Cancel responses queued for the previous attention state.
     stopReader(); // A previous conversation/question cannot own this attention state.
     closeShortKeys(false);
+    pendingRespond = null;
     if (wasReading) startReader();
     renderTaskControls();
   }
@@ -540,6 +543,7 @@ let readerEpoch = 0, readerBusy = false;
 let readTimer = null, lastText = null, lastSize = '', wsRetry = 0, wsTimer = null;
 let liveEpoch = 0;
 let needsResponse = false, outputSource = null, questionReady = false;
+let pendingRespond = null; // { task, trigger } while Respond waits for Read to load the question
 const questionBlocked = (name = current) => name === current && needsResponse && (!questionReady || mode !== 'read');
 function invalidateQuestion() {
   questionReady = false;
@@ -781,6 +785,7 @@ function closeTerm() {
 function setMode(m) {
   if (endedTasks.has(current)) return;
   stopReader(); closeShortKeys(false);
+  if (m !== 'read') pendingRespond = null;
   mode = m; store.set('cockpit-mode', m);
   $('#mode-btn').textContent = m === 'read' ? 'Live' : 'Read';
   $('#mode-btn').setAttribute('aria-label', m === 'read' ? 'Switch to live terminal' : 'Switch to readable output');
@@ -942,7 +947,7 @@ async function pullReader() {
   readerHeight = el.clientHeight;
   if (text === lastText && !sourceChanged) {
     if (resized && readerFollow) el.scrollTop = el.scrollHeight;
-    if (reviewQuestion) { questionReady = true; renderTaskControls(); }
+    if (reviewQuestion) { questionReady = true; renderTaskControls(); resumeRespond(); }
     return;
   }
   const stick = lastText === null || readerFollow || nearBottom(el);
@@ -964,7 +969,7 @@ async function pullReader() {
     readerFollow = stick;
   }
   $('#to-bottom').hidden = nearBottom(el);
-  if (reviewQuestion) { questionReady = true; renderTaskControls(); }
+  if (reviewQuestion) { questionReady = true; renderTaskControls(); resumeRespond(); }
 }
 function startReader() {
   connection('reconnecting');
@@ -1149,6 +1154,14 @@ controlsHeading.append(controlsTitle, closeControls);
 $('#keys').insertBefore(controlsHeading, $('#keys').firstElementChild);
 const keysToggle = $('#keys-toggle');
 let responseTrigger = null;
+// Respond from Live switches to Read; the controls open once that question has loaded,
+// so one tap is enough. Cleared by Live, a new attention state or another task.
+function resumeRespond() {
+  const pending = pendingRespond;
+  pendingRespond = null;
+  if (!pending || pending.task !== current || mode !== 'read' || !needsResponse) return;
+  if (!$('#keys').classList.contains('short-open')) openResponseControls(pending.trigger);
+}
 function closeShortKeys(restoreFocus = true) {
   if (!$('#keys').classList.contains('short-open')) return;
   $('#keys').classList.remove('short-open');
@@ -1160,7 +1173,7 @@ function closeShortKeys(restoreFocus = true) {
 }
 function openResponseControls(trigger = keysToggle) {
   if (!current || endedTasks.has(current) || actionState(current).uncertain) return;
-  if (needsResponse && mode !== 'read') { setMode('read'); return; }
+  if (needsResponse && mode !== 'read') { setMode('read'); pendingRespond = { task: current, trigger }; return; }
   if (questionBlocked()) return;
   responseTrigger = trigger;
   $('#keys').classList.add('short-open');

@@ -931,7 +931,7 @@ test('Needs you preserves the raw setup question and opens Respond controls only
   assert.equal(h.el('#dismiss-startup').hidden,true);
   assert.equal(h.el('#startup-respond').hidden,false);
   assert.match(h.el('#startup-help').textContent,/Review.*question.*Respond/);
-  assert.equal(h.el('#keys-toggle').textContent,'Respond');
+  assert.equal(h.el('#keys-toggle').textContent,'Controls','one Respond: the message row keeps its name');
   assert.equal(h.el('#reader').textContent,question);
   assert.equal(h.el('#keys').classList.contains('short-open'),false);
   h.el('#startup-respond').click();
@@ -1918,11 +1918,18 @@ test('mode changes and task navigation invalidate question reads, queued keys an
   h.el('#startup-respond').click(); await tick();
   assert.equal(h.el('#reader').hidden,false,'Respond in Live loads Read first');
   assert.equal(keyButton(h,'Enter').disabled,true);
+  assert.equal(h.el('#keys').classList.contains('short-open'),false,'controls wait for the current question');
   reply(reads.at(-1), 'Current question A'); await tick();
   assert.equal(h.el('#reader').textContent,'Current question A');
+  assert.equal(h.el('#keys').classList.contains('short-open'),true,'one Respond tap in Live opens controls once Read loads');
+  assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length,0,'opening controls never answers');
   const queued = vm.runInContext("enqueueAction('a', {key:'Enter'}); setMode('live')", h.context);
   await queued; await tick();
   assert.equal(h.calls.filter(c=>c.path.endsWith('/keys')).length,0,'mode change cancels an undispatched queued response');
+  vm.runInContext("setMode('read')",h.context); await tick();
+  vm.runInContext("setMode('live')",h.context); h.el('#startup-respond').click(); vm.runInContext("setMode('live')",h.context);
+  reply(reads.at(-1), 'Question after leaving Read'); await tick();
+  assert.equal(h.el('#keys').classList.contains('short-open'),false,'returning to Live cancels the pending Respond');
   vm.runInContext("setMode('read')",h.context); await tick(); const beforeNavigation=reads.at(-1);
   vm.runInContext("openTerm('b'); openTerm('a')",h.context); await tick(); const afterNavigation=reads.at(-1);
   reply(beforeNavigation,'Stale before navigation'); await tick();
